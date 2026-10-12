@@ -28,7 +28,8 @@ I may submit this fork to gufo, if so this fork will not be maintained.
   tools, prompt-prefix reuse, optional thinking
   (`chat_template_kwargs.enable_thinking`), and `ignore_eos` / `cache_prompt`
   on raw completions.
-- **Docs:** [usage](docs/models/diffusiongemma/README.md),
+- **Docs:** [what changed, in plain English](docs/models/diffusiongemma/CHANGES.md),
+  [usage](docs/models/diffusiongemma/README.md),
   [benchmarks](docs/models/diffusiongemma/BENCHMARKS.md),
   [quality](docs/models/diffusiongemma/QUALITY.md) and
   [kernel experiments](docs/models/diffusiongemma/EXPERIMENTS.md).
