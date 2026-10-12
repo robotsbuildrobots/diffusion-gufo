@@ -9,6 +9,69 @@ Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unifie
 
 **Contributions are welcome!**
 
+## DiffusionGemma quickstart (this fork)
+
+This fork adds [DiffusionGemma 26B-A4B](docs/models/diffusiongemma/README.md),
+Google's block-diffusion Gemma 4 MoE, as a native engine served by
+`gufo serve llm`; it is proposed upstream to
+[gufo-org/gufo](https://github.com/gufo-org/gufo). It needs a Strix Halo
+(Radeon 8060S, `gfx1151`) running Linux with ROCm 7.2.3, and is built from
+source: the prebuilt images in the Quickstart below do not include it yet.
+
+**1. Build.** Debian/Ubuntu packages shown; see
+[Build from source](#build-from-source) for other systems or Nix.
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config \
+  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev ffmpeg \
+  hipblas-dev hipblaslt-dev rocblas-dev hipcub-dev rocprim-dev rocwmma-dev
+git clone https://github.com/robotsbuildrobots/diffusion-gufo
+cd diffusion-gufo
+cmake --preset release
+cmake --build --preset release --parallel 8
+./build/release/gufo diagnose
+```
+
+**2. Download weights.** NVFP4 is the fastest and smallest (about 19 GB);
+FP8 and BF16 are in the [model guide](docs/models/diffusiongemma/README.md#weights).
+`hf` comes with `pip install -U huggingface_hub`.
+
+```sh
+hf download nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
+  --revision ec4ff3df205028f4e81c954c2227f9312b3ec2ea \
+  --local-dir models/diffusiongemma-nvfp4
+```
+
+**3. Serve.** Point `--model` at the checkpoint directory. Startup takes about
+10 s from a warm page cache; stop other GPU servers first.
+
+```sh
+./build/release/gufo serve --port 8080 llm --model models/diffusiongemma-nvfp4 \
+  --served-model-name diffusiongemma --context 131072
+```
+
+**4. Ask it something.** Any OpenAI-compatible client works (Chat
+Completions, Responses, completions, streaming, tools). Thinking is off
+unless the request turns it on:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"diffusiongemma","messages":[{"role":"user","content":"Why is the sky blue?"}]}'
+
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"diffusiongemma","chat_template_kwargs":{"enable_thinking":true},
+       "messages":[{"role":"user","content":"What is 17*23?"}]}'
+```
+
+Expect about 3,400 tok/s prefill at 2K tokens of prompt and about 80 tok/s
+generation on short prompts with NVFP4. Text arrives a 256-token canvas at a
+time. Requests run one at a time, and `temperature`/`top_p` do not apply
+(the diffusion sampler replaces them). Details:
+[usage](docs/models/diffusiongemma/README.md),
+[benchmarks](docs/models/diffusiongemma/BENCHMARKS.md),
+[quality](docs/models/diffusiongemma/QUALITY.md).
+
+
 See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
 for user-facing changes and release history.
 
