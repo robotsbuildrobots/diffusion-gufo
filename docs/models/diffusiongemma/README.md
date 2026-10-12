@@ -46,6 +46,15 @@ at 512 tokens of context, because generation is limited by reading expert weight
 | Unsloth `diffusiongemma-26B-A4B-it-Q8_0.gguf`, in a directory with the BF16 checkpoint's `config.json` and tokenizer files | Q8_0 | 0.034 |
 | [`nvidia/diffusiongemma-26B-A4B-it-NVFP4`](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4) (revision `ec4ff3df`) | NVFP4 experts (E2M1 values, an FP8 scale per 16 and an FP32 scale per matrix; decoded exactly to BF16, activations stay BF16); other matrices BF16 | 0.070 |
 
+```sh
+hf download nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
+  --revision ec4ff3df205028f4e81c954c2227f9312b3ec2ea \
+  --local-dir models/diffusiongemma-nvfp4
+hf download RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic \
+  --revision 3b3dae4697494da5a290e9c0461954449e76c4f5 \
+  --local-dir models/diffusiongemma-fp8
+```
+
 The KL column is the first denoising step's mean per-position divergence on a
 fixed prompt and canvas from the Transformers BF16 forward; Gufo BF16 itself
 scores 0.022 there, and two Transformers attention implementations differ by
