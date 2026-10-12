@@ -285,7 +285,9 @@ struct Engine::Impl {
     profiler->Phase(global ? "qkv_global" : "qkv_sliding");
     kernels::RmsNormToBf16(h.as<float>(), w.input_norm, xn.as<bf16_t>(), t, H,
                            c.rms_eps, stream);
+    profiler->Phase(global ? "qkv_dense_global" : "qkv_dense_sliding");
     Dense(xn.as<void>(), w.qkv, qkv.as<float>(), t, qkv_rows, H);
+    profiler->Phase(global ? "rope_global" : "rope_sliding");
     const int capacity = global ? global_capacity : sliding_capacity;
     const auto pass = global ? cache.GlobalPass() : cache.SlidingPass();
     const std::size_t skip_elements = static_cast<std::size_t>(pass.skip) * hd;
@@ -311,6 +313,7 @@ struct Engine::Impl {
                                 .max_splits = kMaxSplits});
     profiler->Phase(global ? "o_global" : "o_sliding");
     Dense(attn.as<void>(), w.o, o.as<float>(), t, H, c.heads * hd);
+    profiler->Phase("post_attention");
     kernels::PostAttention(h.as<float>(), o.as<float>(), w.post_attention_norm,
                            w.pre_ff_norm, w.pre_ff_norm_2, w.router_scale,
                            ff.as<bf16_t>(), ff2.as<bf16_t>(), rout.as<bf16_t>(),

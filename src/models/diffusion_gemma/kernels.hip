@@ -157,62 +157,94 @@ __global__ void __launch_bounds__(kThreads)
 
 // One block per (token, head slot); blockDim = head_dim / 2, each thread
 // owns the RoPE pair (i, i + head_dim/2).
-__global__ void QkvNormRopeKernel(const float* qkv, const bf16_t* q_norm,
-                                  const bf16_t* k_norm, const float* inv_freq,
-                                  bf16_t* q_out, bf16_t* k_cache,
-                                  bf16_t* v_cache, int q_heads, int kv_heads,
-                                  int hd, bool shared_kv, int first_position,
-                                  int first_slot, int capacity, float eps) {
-  __shared__ float shared[8];
-  const int t = blockIdx.x, slot = blockIdx.y, i = threadIdx.x, half = hd / 2;
+// One block per token: the rotary angles of the token's position are
+// computed once into LDS (sincosf of a large angle is slow, and every head
+// shares them), then each wave normalises, rotates and stores one head at a
+// time. Lane l holds pairs i = 32j + l, the threads of the per-head kernel
+// this replaces, and the squares are summed in that kernel's order (each
+// 32-pair group's xor tree, then the groups in turn), so the outputs are
+// bit-identical to it.
+constexpr int kRopeThreads = 256;
+
+template<int kHalf>
+__global__ void __launch_bounds__(kRopeThreads)
+    QkvNormRopeKernel(const float* qkv, const bf16_t* q_norm,
+                      const bf16_t* k_norm, const float* inv_freq,
+                      bf16_t* q_out, bf16_t* k_cache, bf16_t* v_cache,
+                      int q_heads, int kv_heads, bool shared_kv,
+                      int first_position, int first_slot, int capacity,
+                      float eps) {
+  constexpr int hd = 2 * kHalf, kGroups = kHalf / 32;
+  __shared__ float cosines[kHalf], sines[kHalf];
+  const int t = blockIdx.x, lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const int position = first_position + t;
+  for (int i = threadIdx.x; i < kHalf; i += kRopeThreads) {
+    const float angle = static_cast<float>(position) * inv_freq[i];
+    sincosf(angle, &sines[i], &cosines[i]);
+  }
+  __syncthreads();
   const int row_width = (q_heads + (shared_kv ? 1 : 2) * kv_heads) * hd;
   const float* row = qkv + static_cast<std::size_t>(t) * row_width;
-  enum { kQ, kK, kV } kind;
-  int head;
-  const float* src;
-  if (slot < q_heads) {
-    kind = kQ;
-    head = slot;
-    src = row + head * hd;
-  } else if (slot < q_heads + kv_heads) {
-    kind = kK;
-    head = slot - q_heads;
-    src = row + (q_heads + head) * hd;
-  } else {
-    kind = kV;
-    head = slot - q_heads - kv_heads;
-    src = shared_kv ? row + (q_heads + head) * hd
-                    : row + (q_heads + kv_heads + head) * hd;
-  }
-  // The projection output is a checkpoint-dtype tensor. hipBLASLt's BF16
-  // output kernels do not round like this, so the product stays FP32 until
-  // here.
-  const float x0 = RoundBf16(src[i]), x1 = RoundBf16(src[i + half]);
-  const float r = RmsScale(BlockSum(x0 * x0 + x1 * x1, shared), hd, eps);
-  const int position = first_position + t;
-  if (kind == kV) {
+  const int slots = q_heads + 2 * kv_heads;
+  for (int slot = wave; slot < slots; slot += kRopeThreads / 32) {
+    enum { kQ, kK, kV } kind;
+    int head;
+    const float* src;
+    if (slot < q_heads) {
+      kind = kQ;
+      head = slot;
+      src = row + head * hd;
+    } else if (slot < q_heads + kv_heads) {
+      kind = kK;
+      head = slot - q_heads;
+      src = row + (q_heads + head) * hd;
+    } else {
+      kind = kV;
+      head = slot - q_heads - kv_heads;
+      src = shared_kv ? row + (q_heads + head) * hd
+                      : row + (q_heads + kv_heads + head) * hd;
+    }
+    // The projection output is a checkpoint-dtype tensor. hipBLASLt's BF16
+    // output kernels do not round like this, so the product stays FP32
+    // until here.
+    float x0[kGroups], x1[kGroups];
+    float total = 0;
+#pragma unroll
+    for (int j = 0; j < kGroups; ++j) {
+      const int i = 32 * j + lane;
+      x0[j] = RoundBf16(src[i]);
+      x1[j] = RoundBf16(src[i + kHalf]);
+      total += WaveSum(x0[j] * x0[j] + x1[j] * x1[j]);
+    }
+    const float r = RmsScale(total, hd, eps);
+    if (kind == kV) {
+      bf16_t* dst =
+          v_cache +
+          (static_cast<std::size_t>(head) * capacity + first_slot + t) * hd;
+#pragma unroll
+      for (int j = 0; j < kGroups; ++j) {
+        const int i = 32 * j + lane;
+        dst[i] = ToBf16(x0[j] * r);
+        dst[i + kHalf] = ToBf16(x1[j] * r);
+      }
+      continue;
+    }
+    const bf16_t* w = kind == kQ ? q_norm : k_norm;
     bf16_t* dst =
-        v_cache +
-        (static_cast<std::size_t>(head) * capacity + first_slot + t) * hd;
-    dst[i] = ToBf16(x0 * r);
-    dst[i + half] = ToBf16(x1 * r);
-    return;
+        kind == kQ ? q_out + (static_cast<std::size_t>(t) * q_heads + head) * hd
+                   : k_cache + (static_cast<std::size_t>(head) * capacity +
+                                first_slot + t) *
+                                   hd;
+#pragma unroll
+    for (int j = 0; j < kGroups; ++j) {
+      const int i = 32 * j + lane;
+      const float n0 = RoundBf16(x0[j] * r * ToFloat(w[i]));
+      const float n1 = RoundBf16(x1[j] * r * ToFloat(w[i + kHalf]));
+      const float c = cosines[i], s = sines[i];
+      dst[i] = ToBf16(n0 * c - n1 * s);
+      dst[i + kHalf] = ToBf16(n1 * c + n0 * s);
+    }
   }
-  const bf16_t* w = kind == kQ ? q_norm : k_norm;
-  const float n0 = RoundBf16(x0 * r * ToFloat(w[i]));
-  const float n1 = RoundBf16(x1 * r * ToFloat(w[i + half]));
-  const float angle = static_cast<float>(position) * inv_freq[i];
-  float s, c;
-  sincosf(angle, &s, &c);
-  const bf16_t o0 = ToBf16(n0 * c - n1 * s);
-  const bf16_t o1 = ToBf16(n1 * c + n0 * s);
-  bf16_t* dst =
-      kind == kQ ? q_out + (static_cast<std::size_t>(t) * q_heads + head) * hd
-                 : k_cache + (static_cast<std::size_t>(head) * capacity +
-                              first_slot + t) *
-                                 hd;
-  dst[i] = o0;
-  dst[i + half] = o1;
 }
 
 // One wave per row; experts <= 128 (4 per lane).
@@ -642,10 +674,16 @@ void QkvNormRope(const float* qkv, const bf16_t* q_norm, const bf16_t* k_norm,
                  bf16_t* v_cache, int tokens, int q_heads, int kv_heads,
                  int head_dim, bool shared_kv, int first_position,
                  int first_slot, int capacity, float eps, hipStream_t stream) {
-  const dim3 grid(tokens, q_heads + 2 * kv_heads);
-  QkvNormRopeKernel<<<grid, head_dim / 2, 0, stream>>>(
-      qkv, q_norm, k_norm, rope.inv_freq, q_out, k_cache, v_cache, q_heads,
-      kv_heads, head_dim, shared_kv, first_position, first_slot, capacity, eps);
+  if (head_dim == 256)
+    QkvNormRopeKernel<128><<<tokens, kRopeThreads, 0, stream>>>(
+        qkv, q_norm, k_norm, rope.inv_freq, q_out, k_cache, v_cache, q_heads,
+        kv_heads, shared_kv, first_position, first_slot, capacity, eps);
+  else if (head_dim == 512)
+    QkvNormRopeKernel<256><<<tokens, kRopeThreads, 0, stream>>>(
+        qkv, q_norm, k_norm, rope.inv_freq, q_out, k_cache, v_cache, q_heads,
+        kv_heads, shared_kv, first_position, first_slot, capacity, eps);
+  else
+    throw std::invalid_argument("QkvNormRope: unsupported head dimension");
   CheckLaunch("QkvNormRope");
 }
 
