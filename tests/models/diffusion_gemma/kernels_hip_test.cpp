@@ -305,10 +305,11 @@ double Gelu(double x) {
          (1.0 + std::tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 }
 
-void Experts(Weights format, const char* name) {
+void Experts(Weights format, const char* name, int group_rows) {
   constexpr int kExperts = 4, kHidden = 256, kInter = 128, kTokens = 80;
-  // Expert 0 gets 70 rows (two row groups), expert 2 none.
-  std::vector<std::int32_t> counts = {70, 25, 0, 41};
+  // Expert 0 gets 150 rows (three 64-row or two 128-row groups), expert 2
+  // none.
+  std::vector<std::int32_t> counts = {150, 25, 0, 41};
   std::vector<std::int32_t> offsets(kExperts), source;
   std::mt19937 rng(11);
   for (int e = 0, at = 0; e < kExperts; ++e) {
@@ -322,9 +323,13 @@ void Experts(Weights format, const char* name) {
   const ExpertMatrix gate_up(kExperts, 2 * kInter, kHidden, 13);
   const ExpertMatrix down(kExperts, kHidden, kInter, 14);
 
-  // Dispatch's group list: expert 0's two groups, experts 1 and 3.
-  const std::vector<std::int32_t> groups = {0, 0, 0, 64, 1, 0, 3, 0};
-  const std::vector<std::int32_t> group_count = {4};
+  // Dispatch's group list: expert 0's groups, experts 1 and 3.
+  std::vector<std::int32_t> groups;
+  for (int first = 0; first < counts[0]; first += group_rows)
+    groups.insert(groups.end(), {0, first});
+  groups.insert(groups.end(), {1, 0, 3, 0});
+  const std::vector<std::int32_t> group_count = {
+      static_cast<std::int32_t>(groups.size() / 2)};
   Device<bf16> dx(x), act(std::size_t(assignments) * kInter),
       out(std::size_t(assignments) * kHidden);
   Device<std::int32_t> dcounts(counts), doffsets(offsets), dsource(source),
@@ -334,7 +339,8 @@ void Experts(Weights format, const char* name) {
                                  .source = dsource.get(),
                                  .groups = dgroups.get(),
                                  .group_count = dgroup_count.get(),
-                                 .max_groups = 6};
+                                 .max_groups = group_count[0] + 1,
+                                 .group_rows = group_rows};
   Device<bf16> gu_bf16(gate_up.bf16_values), dn_bf16(down.bf16_values);
   Device<std::int8_t> gu_q8(gate_up.q8_values), dn_q8(down.q8_values);
   Device<std::uint16_t> gu_q8s(gate_up.q8_scales), dn_q8s(down.q8_scales);
@@ -388,8 +394,10 @@ void Experts(Weights format, const char* name) {
                               std::abs(got - want) / (1e-3 + std::abs(want)));
       }
     }
-  std::printf("experts %-5s gate/up error %.2e  down error %.2e\n", name,
-              act_error, down_error);
+  std::printf(
+      "experts %-5s %3d-row groups gate/up error %.2e  down error "
+      "%.2e\n",
+      name, group_rows, act_error, down_error);
   Expect(act_error < 2e-2, "expert gate/up");
   Expect(down_error < 1e-2, "expert down");
 }
@@ -621,10 +629,12 @@ int main() {
              0, true});
   Attention({"sliding canvas hd256 offset", 256, 16, 8, 64, 400, 1300, 964,
              false, 0, true});
-  Experts(Weights::kBf16, "bf16");
-  Experts(Weights::kQ8, "q8");
-  Experts(Weights::kFp8, "fp8");
-  Experts(Weights::kFp4, "nvfp4");
+  for (const int group_rows : {64, 128}) {
+    Experts(Weights::kBf16, "bf16", group_rows);
+    Experts(Weights::kQ8, "q8", group_rows);
+    Experts(Weights::kFp8, "fp8", group_rows);
+    Experts(Weights::kFp4, "nvfp4", group_rows);
+  }
   Linear(256, 4096, 256);
   Linear(300, 384, 512);
   Linear(256, 128, 1024);

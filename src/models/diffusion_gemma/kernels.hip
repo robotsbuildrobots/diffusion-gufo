@@ -295,7 +295,7 @@ __global__ void __launch_bounds__(1024)
                    std::int32_t* offsets, std::int32_t* source,
                    std::int32_t* slot, std::int32_t* groups,
                    std::int32_t* group_count, int assignments, int experts,
-                   int k) {
+                   int k, int group_rows) {
   __shared__ int count[256], start[256], cursor[256];
   for (int e = threadIdx.x; e < experts; e += blockDim.x) {
     count[e] = 0;
@@ -307,12 +307,12 @@ __global__ void __launch_bounds__(1024)
   __syncthreads();
   if (threadIdx.x == 0) {
     // Expert offsets, and the expert products' work list: one entry per
-    // 64-row group of each expert.
+    // group of each expert.
     int running = 0, listed = 0;
     for (int e = 0; e < experts; ++e) {
       start[e] = running;
       running += count[e];
-      for (int first = 0; first < count[e]; first += kExpertGroupRows) {
+      for (int first = 0; first < count[e]; first += group_rows) {
         groups[2 * listed] = e;
         groups[2 * listed + 1] = first;
         ++listed;
@@ -662,12 +662,12 @@ void Route(const float* logits, const bf16_t* per_expert_scale,
 void Dispatch(const std::int32_t* index, std::int32_t* counts,
               std::int32_t* offsets, std::int32_t* source, std::int32_t* slot,
               std::int32_t* groups, std::int32_t* group_count, int rows,
-              int experts, int k, hipStream_t stream) {
+              int experts, int k, int group_rows, hipStream_t stream) {
   if (experts > 256)
     throw std::invalid_argument("Dispatch: unsupported expert count");
   DispatchKernel<<<1, 1024, 0, stream>>>(index, counts, offsets, source, slot,
                                          groups, group_count, rows * k, experts,
-                                         k);
+                                         k, group_rows);
   CheckLaunch("Dispatch");
 }
 

@@ -12,7 +12,6 @@
 namespace gufo::models::diffusion_gemma::kernels {
 namespace {
 
-constexpr int kRows = kExpertGroupRows;  // Routed rows (4 row tiles).
 constexpr int kCols = 128;          // Weight rows (output columns) per block.
 constexpr int kDepth = 64;          // Reduction depth per stage.
 constexpr int kPitch = kDepth + 8;  // Padded LDS row: 144 bytes.
@@ -158,8 +157,8 @@ enum Format { kWeightsBf16, kWeightsQ8, kWeightsFp8, kWeightsFp4 };
 // bf16(gelu(gate) * up). Otherwise A is the contiguous activation and the
 // epilogue writes the output as BF16, the checkpoint dtype of the
 // reference's expert projection.
-template<bool kGateUp, Format kFormat>
-__global__ void __launch_bounds__(256)
+template<bool kGateUp, Format kFormat, int kRowsT>
+__global__ void __launch_bounds__(kRowsT * 4)
     ExpertKernel(const bf16_t* a_base, const bf16_t* weights,
                  const std::int8_t* q_values, const std::uint16_t* q_scales,
                  const bf16_t* row_scales, const std::uint8_t* block_scales,
@@ -168,14 +167,21 @@ __global__ void __launch_bounds__(256)
   constexpr bool kQ8 = kFormat == kWeightsQ8;
   constexpr bool kFp4 = kFormat == kWeightsFp4;
   constexpr bool kBytes = kFormat == kWeightsQ8 || kFormat == kWeightsFp8;
-  constexpr int kStage = (kRows + kCols) * kPitch;  // bf16 elements.
-  constexpr int kBlocks = kDepth / 32;              // Q8_0 blocks per stage.
-  constexpr int kStageBytes = 2 * kStage * 2;
-  constexpr int kEpilogueBytes = kRows * (kCols + 1) * 4;
+  // Waves: kWM row strips of 32 rows x 4 column groups of 32 columns, so
+  // 128-row groups run 16 waves with the 64-row kernel's registers per wave.
+  constexpr int kThreads = kRowsT * 4;
+  constexpr int kWM = kRowsT / 32, kWN = 4, kNT = 2;
+  // 64-row groups double-buffer their stages; 128-row groups use one buffer
+  // (two would exceed 64 KB) with a second barrier per stage.
+  constexpr int kBuffers = kRowsT == 64 ? 2 : 1;
+  constexpr int kStage = (kRowsT + kCols) * kPitch;  // bf16 elements.
+  constexpr int kBlocks = kDepth / 32;               // Q8_0 blocks per stage.
+  constexpr int kStageBytes = kBuffers * kStage * 2;
+  constexpr int kEpilogueBytes = 64 * (kCols + 1) * 4;  // 64 rows at a time.
   constexpr int kShared =
       kStageBytes > kEpilogueBytes ? kStageBytes : kEpilogueBytes;
   __shared__ __attribute__((aligned(16))) unsigned char shared[kShared];
-  __shared__ float stage_scales[kQ8 ? 2 : 1][kQ8 ? kCols : 1][kBlocks];
+  __shared__ float stage_scales[kQ8 ? kBuffers : 1][kQ8 ? kCols : 1][kBlocks];
   auto* stages = reinterpret_cast<bf16_t*>(shared);
 
   const int work = blockIdx.y, tile = blockIdx.x;
@@ -183,11 +189,10 @@ __global__ void __launch_bounds__(256)
     return;
   const int expert = routing.groups[2 * work];
   const int group = routing.groups[2 * work + 1];
-  const int live = min(kRows, routing.counts[expert] - group);
+  const int live = min(kRowsT, routing.counts[expert] - group);
   const int first = routing.offsets[expert] + group;
   const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
-  // Wave layout: 2 row halves (32 rows) x 4 column groups (32 columns).
-  const int wave_m = wave / 4, wave_n = wave % 4;
+  const int wave_m = wave / kWN, wave_n = wave % kWN;
   const std::size_t matrix_rows = kGateUp ? 2 * inter : out_width;
   const std::size_t expert_base =
       static_cast<std::size_t>(expert) * matrix_rows * depth;
@@ -199,33 +204,39 @@ __global__ void __launch_bounds__(256)
   };
   // This thread's weight pieces, 16 bytes each: 128 rows x 64 values is
   // 1024 BF16 pieces (8 per row), 512 8-bit pieces (4 per row) or 256 FP4
-  // pieces (2 per row). Offsets count values.
-  constexpr int kPieces = kFp4 ? 1 : (kBytes ? 2 : 4);
+  // pieces (2 per row), shared by kThreads threads (with 512 threads, only
+  // the first 256 take an FP4 piece). Offsets count values.
   constexpr int kPerRow = kFp4 ? 2 : (kBytes ? 4 : 8);
   constexpr int kValues = kFp4 ? 32 : (kBytes ? 16 : 8);
+  constexpr int kAllPieces = kCols * kPerRow;
+  constexpr int kPieces = (kAllPieces + kThreads - 1) / kThreads;
+  const bool w_owner = kAllPieces >= kThreads || tid < kAllPieces;
   std::size_t w_src[kPieces];
   int w_dst[kPieces];
 #pragma unroll
   for (int j = 0; j < kPieces; ++j) {
-    const int index = j * 256 + tid;
+    const int index = min(j * kThreads + tid, kAllPieces - 1);
     const int r = index / kPerRow, chunk = (index % kPerRow) * kValues;
     w_src[j] = expert_base + tile_row(r) * depth + chunk;
-    w_dst[j] = (kRows + r) * kPitch + chunk;
+    w_dst[j] = (kRowsT + r) * kPitch + chunk;
   }
-  // Q8_0: this thread stages one block scale per stage.
-  const int scale_row = tid / kBlocks, scale_block = tid % kBlocks;
+  // Q8_0: the first 256 threads stage one block scale each per stage.
+  const bool scale_owner = tid < kCols * kBlocks;
+  const int scale_row = min(tid / kBlocks, kCols - 1),
+            scale_block = tid % kBlocks;
   const std::size_t scale_src =
       kQ8 ? (expert_base + tile_row(scale_row) * depth) / 32 + scale_block : 0;
 
   const int tiles_m = (live + 15) / 16;
-  // Activation pieces: 64 rows x 64 values = 512 pieces. Rows past the
+  // Activation pieces: kRowsT rows x 64 values, 8 per piece. Rows past the
   // group's end repeat its last row, whose products are never stored, so
   // the loads need no branch.
-  const bf16_t* a_src[2];
-  int a_dst[2];
+  constexpr int kAPieces = kRowsT * kDepth / 8 / kThreads;
+  const bf16_t* a_src[kAPieces];
+  int a_dst[kAPieces];
 #pragma unroll
-  for (int j = 0; j < 2; ++j) {
-    const int index = j * 256 + tid;
+  for (int j = 0; j < kAPieces; ++j) {
+    const int index = j * kThreads + tid;
     const int r = index / 8, chunk = (index % 8) * 8;
     a_dst[j] = r * kPitch + chunk;
     const int position = first + min(r, live - 1);
@@ -234,19 +245,19 @@ __global__ void __launch_bounds__(256)
                 : static_cast<std::size_t>(position);
     a_src[j] = a_base + row * depth + chunk;
   }
-  Accumulator acc[2][2];
+  Accumulator acc[2][kNT];
 #pragma unroll
   for (int m = 0; m < 2; ++m)
 #pragma unroll
-    for (int n = 0; n < 2; ++n)
+    for (int n = 0; n < kNT; ++n)
       acc[m][n] = Accumulator{};
 
   // Native vector types: HIP's uint4 kept these registers in scratch.
-  U32x4 a_next[2], w_next[kPieces];
+  U32x4 a_next[kAPieces], w_next[kPieces];
   std::uint16_t scale_next = 0;
   const auto fetch = [&](int k0) {
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+    for (int j = 0; j < kAPieces; ++j)
       a_next[j] = *reinterpret_cast<const U32x4*>(a_src[j] + k0);
 #pragma unroll
     for (int j = 0; j < kPieces; ++j) {
@@ -266,23 +277,28 @@ __global__ void __launch_bounds__(256)
   };
   fetch(0);
   int buffer = 0;
+  const int col0 = wave_n * kNT * 16;
   for (int k0 = 0; k0 < depth; k0 += kDepth) {
+    if (kBuffers == 1 && k0 > 0)
+      LdsBarrier();  // The previous stage is consumed.
     bf16_t* stage = stages + buffer * kStage;
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+    for (int j = 0; j < kAPieces; ++j)
       *reinterpret_cast<U32x4*>(stage + a_dst[j]) = a_next[j];
+    if (w_owner) {
 #pragma unroll
-    for (int j = 0; j < kPieces; ++j) {
-      if constexpr (kFormat == kWeightsQ8)
-        Int8ToBf16(w_next[j], stage + w_dst[j]);
-      else if constexpr (kFormat == kWeightsFp8)
-        Fp8ToBf16(w_next[j], stage + w_dst[j]);
-      else if constexpr (kFp4)
-        Fp4ToBf16(w_next[j], scale_next, stage + w_dst[j]);
-      else
-        *reinterpret_cast<U32x4*>(stage + w_dst[j]) = w_next[j];
+      for (int j = 0; j < kPieces; ++j) {
+        if constexpr (kFormat == kWeightsQ8)
+          Int8ToBf16(w_next[j], stage + w_dst[j]);
+        else if constexpr (kFormat == kWeightsFp8)
+          Fp8ToBf16(w_next[j], stage + w_dst[j]);
+        else if constexpr (kFp4)
+          Fp4ToBf16(w_next[j], scale_next, stage + w_dst[j]);
+        else
+          *reinterpret_cast<U32x4*>(stage + w_dst[j]) = w_next[j];
+      }
     }
-    if constexpr (kQ8)
+    if (kQ8 && scale_owner)
       stage_scales[buffer][scale_row][scale_block] =
           __half2float(__ushort_as_half(scale_next));
     LdsBarrier();
@@ -290,38 +306,38 @@ __global__ void __launch_bounds__(256)
     // the registers out of scratch.
     fetch(min(k0 + kDepth, depth - kDepth));
     const bf16_t* at = stage;
-    const bf16_t* wt = stage + kRows * kPitch;
+    const bf16_t* wt = stage + kRowsT * kPitch;
     if (kQ8 && wave_m * 2 < tiles_m) {
       // One 32-wide Q8_0 block at a time, scaled per output column.
 #pragma unroll
       for (int blk = 0; blk < kBlocks; ++blk) {
-        Accumulator part[2][2];
+        Accumulator part[2][kNT];
 #pragma unroll
         for (int m = 0; m < 2; ++m)
 #pragma unroll
-          for (int n = 0; n < 2; ++n)
+          for (int n = 0; n < kNT; ++n)
             part[m][n] = Accumulator{};
 #pragma unroll
         for (int s = blk * 2; s < blk * 2 + 2; ++s) {
-          Fragment b[2];
+          Fragment b[kNT];
 #pragma unroll
-          for (int n = 0; n < 2; ++n)
-            b[n] = LoadFragment(
-                wt + (wave_n * 32 + n * 16 + lane % 16) * kPitch + s * 16);
+          for (int n = 0; n < kNT; ++n)
+            b[n] = LoadFragment(wt + (col0 + n * 16 + lane % 16) * kPitch +
+                                s * 16);
 #pragma unroll
           for (int m = 0; m < 2; ++m)
             if (wave_m * 2 + m < tiles_m) {
               const Fragment a = LoadFragment(
                   at + ((wave_m * 2 + m) * 16 + lane % 16) * kPitch + s * 16);
 #pragma unroll
-              for (int n = 0; n < 2; ++n)
+              for (int n = 0; n < kNT; ++n)
                 part[m][n] = Mma(a, b[n], part[m][n]);
             }
         }
 #pragma unroll
-        for (int n = 0; n < 2; ++n) {
+        for (int n = 0; n < kNT; ++n) {
           const float scale =
-              stage_scales[buffer][wave_n * 32 + n * 16 + lane % 16][blk];
+              stage_scales[buffer][col0 + n * 16 + lane % 16][blk];
 #pragma unroll
           for (int m = 0; m < 2; ++m)
 #pragma unroll
@@ -332,32 +348,33 @@ __global__ void __launch_bounds__(256)
     } else if (!kQ8 && wave_m * 2 < tiles_m) {
 #pragma unroll
       for (int s = 0; s < kDepth / 16; ++s) {
-        Fragment b[2];
+        Fragment b[kNT];
 #pragma unroll
-        for (int n = 0; n < 2; ++n)
-          b[n] = LoadFragment(wt + (wave_n * 32 + n * 16 + lane % 16) * kPitch +
-                              s * 16);
+        for (int n = 0; n < kNT; ++n)
+          b[n] =
+              LoadFragment(wt + (col0 + n * 16 + lane % 16) * kPitch + s * 16);
 #pragma unroll
         for (int m = 0; m < 2; ++m)
           if (wave_m * 2 + m < tiles_m) {
             const Fragment a = LoadFragment(
                 at + ((wave_m * 2 + m) * 16 + lane % 16) * kPitch + s * 16);
 #pragma unroll
-            for (int n = 0; n < 2; ++n)
+            for (int n = 0; n < kNT; ++n)
               acc[m][n] = Mma(a, b[n], acc[m][n]);
           }
       }
     }
-    // The other buffer is written next; its readers finished before the
-    // barrier above, so one barrier per stage suffices.
-    buffer ^= 1;
+    // Double-buffered: the other buffer is written next; its readers
+    // finished before the barrier above, so one barrier per stage suffices.
+    if constexpr (kBuffers == 2)
+      buffer ^= 1;
   }
 
   if constexpr (kFormat == kWeightsFp8 || kFp4) {
 #pragma unroll
-    for (int n = 0; n < 2; ++n) {
+    for (int n = 0; n < kNT; ++n) {
       const std::size_t row = static_cast<std::size_t>(expert) * matrix_rows +
-                              tile_row(wave_n * 32 + n * 16 + lane % 16);
+                              tile_row(col0 + n * 16 + lane % 16);
       const float scale = kFp4 ? tensor_scales[row] : ToFloat(row_scales[row]);
 #pragma unroll
       for (int m = 0; m < 2; ++m)
@@ -367,72 +384,96 @@ __global__ void __launch_bounds__(256)
     }
   }
 
-  // Stage the tile in LDS (the stages are consumed) so that the outputs
-  // are written a row at a time.
-  LdsBarrier();
+  // Stage the tile in LDS, 64 rows at a time (the stages are consumed), so
+  // that the outputs are written a row at a time.
   auto* staged = reinterpret_cast<float (*)[kCols + 1]>(shared);
-#pragma unroll
-  for (int m = 0; m < 2; ++m)
-#pragma unroll
-    for (int n = 0; n < 2; ++n)
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        staged[(wave_m * 2 + m) * 16 + 2 * i + lane / 16]
-              [wave_n * 32 + n * 16 + lane % 16] = acc[m][n][i];
-  LdsBarrier();
   auto* result = static_cast<bf16_t*>(out);
-  if constexpr (kGateUp) {
-    for (int index = tid; index < live * 64; index += 256) {
-      const int r = index / 64, c = index % 64;
-      // The fused gate/up output is a checkpoint-dtype tensor.
-      const float g = RoundBf16(staged[r][c]);
-      const float u = RoundBf16(staged[r][64 + c]);
-      result[static_cast<std::size_t>(first + r) * inter + 64 * tile + c] =
-          ToBf16(RoundBf16(GeluTanh(g)) * u);
+#pragma unroll
+  for (int half = 0; half < kRowsT / 64; ++half) {
+    LdsBarrier();
+    if (wave_m / 2 == half) {
+#pragma unroll
+      for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int n = 0; n < kNT; ++n)
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            staged[(wave_m % 2 * 2 + m) * 16 + 2 * i + lane / 16]
+                  [col0 + n * 16 + lane % 16] = acc[m][n][i];
     }
-  } else {
-    for (int index = tid; index < live * kCols; index += 256) {
-      const int r = index / kCols, c = index % kCols;
-      result[static_cast<std::size_t>(first + r) * out_width + kCols * tile +
-             c] = ToBf16(staged[r][c]);
+    LdsBarrier();
+    const int rows = min(64, live - half * 64);
+    const int base = first + half * 64;
+    if constexpr (kGateUp) {
+      for (int index = tid; index < rows * 64; index += kThreads) {
+        const int r = index / 64, c = index % 64;
+        // The fused gate/up output is a checkpoint-dtype tensor.
+        const float g = RoundBf16(staged[r][c]);
+        const float u = RoundBf16(staged[r][64 + c]);
+        result[static_cast<std::size_t>(base + r) * inter + 64 * tile + c] =
+            ToBf16(RoundBf16(GeluTanh(g)) * u);
+      }
+    } else {
+      for (int index = tid; index < rows * kCols; index += kThreads) {
+        const int r = index / kCols, c = index % kCols;
+        result[static_cast<std::size_t>(base + r) * out_width + kCols * tile +
+               c] = ToBf16(staged[r][c]);
+      }
     }
   }
 }
 
 }  // namespace
 
-int ExpertGroupBound(int rows, int experts, int k) {
+int ExpertGroupBound(int rows, int experts, int k, int group_rows) {
   // Each active expert's last group may be partial.
   const int assignments = rows * k;
-  return (assignments + kRows - 1) / kRows + std::min(experts, assignments);
+  return (assignments + group_rows - 1) / group_rows +
+         std::min(experts, assignments);
 }
 
 namespace {
 
 // One launch of ExpertKernel for whichever weights are set (NVFP4, then FP8,
 // then Q8_0, else BF16).
+template<bool kGateUp, int kRowsT>
+void LaunchExpertsRows(dim3 grid, hipStream_t stream, const bf16_t* a,
+                       const bf16_t* bf16_weights, const ExpertRouting& routing,
+                       void* out, int depth, int inter, int out_width,
+                       ExpertQ8 q8, ExpertFp8 fp8, ExpertFp4 fp4) {
+  if (fp4.values != nullptr)
+    ExpertKernel<kGateUp, kWeightsFp4, kRowsT><<<grid, kRowsT * 4, 0, stream>>>(
+        a, nullptr, reinterpret_cast<const std::int8_t*>(fp4.values), nullptr,
+        nullptr, fp4.block_scales, fp4.tensor_scales, routing, out, depth,
+        inter, out_width);
+  else if (fp8.values != nullptr)
+    ExpertKernel<kGateUp, kWeightsFp8, kRowsT><<<grid, kRowsT * 4, 0, stream>>>(
+        a, nullptr, reinterpret_cast<const std::int8_t*>(fp8.values), nullptr,
+        fp8.scales, nullptr, nullptr, routing, out, depth, inter, out_width);
+  else if (q8.values != nullptr)
+    ExpertKernel<kGateUp, kWeightsQ8, kRowsT><<<grid, kRowsT * 4, 0, stream>>>(
+        a, nullptr, q8.values, q8.scales, nullptr, nullptr, nullptr, routing,
+        out, depth, inter, out_width);
+  else
+    ExpertKernel<kGateUp, kWeightsBf16, kRowsT>
+        <<<grid, kRowsT * 4, 0, stream>>>(a, bf16_weights, nullptr, nullptr,
+                                          nullptr, nullptr, nullptr, routing,
+                                          out, depth, inter, out_width);
+}
+
 template<bool kGateUp>
 void LaunchExperts(dim3 grid, hipStream_t stream, const bf16_t* a,
                    const bf16_t* bf16_weights, const ExpertRouting& routing,
                    void* out, int depth, int inter, int out_width, ExpertQ8 q8,
                    ExpertFp8 fp8, ExpertFp4 fp4) {
-  if (fp4.values != nullptr)
-    ExpertKernel<kGateUp, kWeightsFp4><<<grid, 256, 0, stream>>>(
-        a, nullptr, reinterpret_cast<const std::int8_t*>(fp4.values), nullptr,
-        nullptr, fp4.block_scales, fp4.tensor_scales, routing, out, depth,
-        inter, out_width);
-  else if (fp8.values != nullptr)
-    ExpertKernel<kGateUp, kWeightsFp8><<<grid, 256, 0, stream>>>(
-        a, nullptr, reinterpret_cast<const std::int8_t*>(fp8.values), nullptr,
-        fp8.scales, nullptr, nullptr, routing, out, depth, inter, out_width);
-  else if (q8.values != nullptr)
-    ExpertKernel<kGateUp, kWeightsQ8><<<grid, 256, 0, stream>>>(
-        a, nullptr, q8.values, q8.scales, nullptr, nullptr, nullptr, routing,
-        out, depth, inter, out_width);
+  if (routing.group_rows == 128)
+    LaunchExpertsRows<kGateUp, 128>(grid, stream, a, bf16_weights, routing, out,
+                                    depth, inter, out_width, q8, fp8, fp4);
+  else if (routing.group_rows == 64)
+    LaunchExpertsRows<kGateUp, 64>(grid, stream, a, bf16_weights, routing, out,
+                                   depth, inter, out_width, q8, fp8, fp4);
   else
-    ExpertKernel<kGateUp, kWeightsBf16><<<grid, 256, 0, stream>>>(
-        a, bf16_weights, nullptr, nullptr, nullptr, nullptr, nullptr, routing,
-        out, depth, inter, out_width);
+    throw std::invalid_argument("expert products: unsupported group rows");
 }
 
 }  // namespace

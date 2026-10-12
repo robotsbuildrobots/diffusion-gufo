@@ -190,7 +190,8 @@ struct Engine::Impl {
     source = Buffer(A * 4);
     slot = Buffer(A * 4);
     groups = Buffer(
-        std::size_t(kernels::ExpertGroupBound(rows, c.experts, c.top_k)) * 8);
+        std::size_t(kernels::ExpertGroupBound(rows, c.experts, c.top_k, 64)) *
+        8);
     group_count = Buffer(4);
     expert_act = Buffer(A * c.expert_intermediate * 2);
     expert_out = Buffer(A * H * 2);
@@ -281,7 +282,7 @@ struct Engine::Impl {
     const bool global = c.is_global[l];
     const int H = c.hidden, hd = c.head_dim(l), kv = c.kv_heads(l);
     const int qkv_rows = (c.heads + (global ? 1 : 2) * kv) * hd;
-    profiler->Phase(global ? "attn_global" : "attn_sliding");
+    profiler->Phase(global ? "qkv_global" : "qkv_sliding");
     kernels::RmsNormToBf16(h.as<float>(), w.input_norm, xn.as<bf16_t>(), t, H,
                            c.rms_eps, stream);
     Dense(xn.as<void>(), w.qkv, qkv.as<float>(), t, qkv_rows, H);
@@ -297,6 +298,7 @@ struct Engine::Impl {
                          stream);
     // Encoder passes are causal (sliding layers also windowed); decoder
     // passes see the cache and the whole canvas.
+    profiler->Phase(global ? "attn_global" : "attn_sliding");
     kernels::Attention(
         q.as<bf16_t>(), k_cache[l].as<bf16_t>() + skip_elements,
         v_cache[l].as<bf16_t>() + skip_elements, attn.as<bf16_t>(), t, c.heads,
@@ -307,6 +309,7 @@ struct Engine::Impl {
                                 .stats = split_stats.as<float>(),
                                 .capacity = split_out.bytes() / 4,
                                 .max_splits = kMaxSplits});
+    profiler->Phase(global ? "o_global" : "o_sliding");
     Dense(attn.as<void>(), w.o, o.as<float>(), t, H, c.heads * hd);
     kernels::PostAttention(h.as<float>(), o.as<float>(), w.post_attention_norm,
                            w.pre_ff_norm, w.pre_ff_norm_2, w.router_scale,
@@ -325,6 +328,16 @@ struct Engine::Impl {
           c.intermediate);
   }
 
+  /// Rows per expert group for a pass of `t` rows: 128 for prompt chunks,
+  /// whose experts average about 2t*8/128 rows, so that each widened weight
+  /// tile serves twice the rows; 64 for canvases (about 25 rows per expert)
+  /// and for Q8_0, whose per-block scaling makes the larger tile slower.
+  int ExpertGroupRows(int t) const {
+    const bool q8 =
+        device_weights->view().layers[0].expert_gate_up_q8 != nullptr;
+    return t > config.canvas && !q8 ? 128 : 64;
+  }
+
   /// Mixture of experts on `ff2` (routed by `rout`): per-assignment outputs
   /// in `expert_out`, combined by FinishLayer.
   void ExpertBlock(int l, int t) {
@@ -337,18 +350,21 @@ struct Engine::Impl {
     kernels::Route(router_logits.as<float>(), w.per_expert_scale,
                    top_index.as<std::int32_t>(), top_weight.as<float>(), t,
                    c.experts, c.top_k, stream);
+    const int group_rows = ExpertGroupRows(t);
     kernels::Dispatch(top_index.as<std::int32_t>(), counts.as<std::int32_t>(),
                       offsets.as<std::int32_t>(), source.as<std::int32_t>(),
                       slot.as<std::int32_t>(), groups.as<std::int32_t>(),
                       group_count.as<std::int32_t>(), t, c.experts, c.top_k,
-                      stream);
+                      group_rows, stream);
     const kernels::ExpertRouting routing{
         .counts = counts.as<std::int32_t>(),
         .offsets = offsets.as<std::int32_t>(),
         .source = source.as<std::int32_t>(),
         .groups = groups.as<std::int32_t>(),
         .group_count = group_count.as<std::int32_t>(),
-        .max_groups = kernels::ExpertGroupBound(t, c.experts, c.top_k)};
+        .max_groups =
+            kernels::ExpertGroupBound(t, c.experts, c.top_k, group_rows),
+        .group_rows = group_rows};
     if (profiler->enabled() && t == c.canvas)
       CountActiveExperts();
     profiler->Phase("expert_gate_up");

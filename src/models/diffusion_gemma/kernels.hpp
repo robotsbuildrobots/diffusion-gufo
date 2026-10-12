@@ -85,28 +85,27 @@ void Route(const float* logits, const bf16_t* per_expert_scale,
 /// Groups the rows*k assignments by expert. counts/offsets: experts entries;
 /// source[pos] = token of the assignment at sorted position pos;
 /// slot[t*k + j] = sorted position of token t's j-th assignment. `groups`
-/// lists each expert's 64-row groups as (expert, first row within the
-/// expert) pairs, *group_count of them (at most ExpertGroupBound).
+/// lists each expert's `group_rows`-row groups (64 or 128) as (expert,
+/// first row within the expert) pairs, *group_count of them (at most
+/// ExpertGroupBound).
 void Dispatch(const std::int32_t* index, std::int32_t* counts,
               std::int32_t* offsets, std::int32_t* source, std::int32_t* slot,
               std::int32_t* groups, std::int32_t* group_count, int rows,
-              int experts, int k, hipStream_t stream);
-
-/// Rows per entry of Dispatch's group list.
-constexpr int kExpertGroupRows = 64;
+              int experts, int k, int group_rows, hipStream_t stream);
 
 /// Upper bound of Dispatch's group count for `rows` rows.
-int ExpertGroupBound(int rows, int experts, int k);
+int ExpertGroupBound(int rows, int experts, int k, int group_rows);
 
 /// Dispatch's grouping, read by the expert products: one workgroup column
-/// per 64-row group.
+/// per group of `group_rows` rows.
 struct ExpertRouting {
   const std::int32_t* counts{nullptr};
   const std::int32_t* offsets{nullptr};
   const std::int32_t* source{nullptr};
   const std::int32_t* groups{nullptr};
   const std::int32_t* group_count{nullptr};
-  int max_groups{0};  ///< ExpertGroupBound for the pass's rows.
+  int max_groups{0};   ///< ExpertGroupBound for the pass's rows.
+  int group_rows{64};  ///< Rows per group: 64 or 128.
 };
 
 /// Grouped expert gate/up projection with fused activation:
