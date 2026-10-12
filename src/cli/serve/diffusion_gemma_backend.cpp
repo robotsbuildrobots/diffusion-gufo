@@ -104,12 +104,13 @@ TextGenerationBackend::Result DiffusionGemmaBackend::CompleteRaw(
     const sampling::SamplingConfig& sampling,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool ignore_eos, bool cache_prompt) {
+    bool ignore_eos, bool cache_prompt, const TokenIdsCallback& on_token_ids) {
   auto ids = engine_->tokenizer().Encode(prompt);
   if (ids.empty() || ids.front() != engine_->config().bos_id)
     ids.insert(ids.begin(), engine_->config().bos_id);
   return Run(ids, max_tokens, sampling, is_cancelled, on_token, client_id,
-             stop_sequences, Thinking::kTagged, ignore_eos, cache_prompt);
+             stop_sequences, Thinking::kTagged, ignore_eos, cache_prompt,
+             on_token_ids);
 }
 
 std::shared_ptr<TextGenerationBackend::GenerationRequest>
@@ -149,10 +150,15 @@ DiffusionGemmaBackend::start_complete(
             return cancelled_.load(std::memory_order_acquire) ||
                    (cancellation_ && cancellation_());
           },
-          on_token, client_id_, stop_sequences_, ignore_eos_, cache_prompt_);
+          on_token, client_id_, stop_sequences_, ignore_eos_, cache_prompt_,
+          on_token_ids_);
     }
     void Cancel() noexcept override {
       cancelled_.store(true, std::memory_order_release);
+    }
+    bool SetTokenIdsCallback(TokenIdsCallback on_ids) override {
+      on_token_ids_ = std::move(on_ids);
+      return true;
     }
 
   private:
@@ -165,6 +171,7 @@ DiffusionGemmaBackend::start_complete(
     std::vector<std::string> stop_sequences_;
     bool ignore_eos_;
     bool cache_prompt_;
+    TokenIdsCallback on_token_ids_;
     std::atomic<bool> waited_{false};
     std::atomic<bool> cancelled_{false};
   };
@@ -252,7 +259,8 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
     const sampling::SamplingConfig& sampling,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    Thinking thinking, bool ignore_eos, bool cache_prompt) {
+    Thinking thinking, bool ignore_eos, bool cache_prompt,
+    const TokenIdsCallback& on_token_ids) {
   std::lock_guard<std::mutex> lock(mutex_);
   // Without prompt caching the request encodes its whole prompt.
   if (!cache_prompt)
@@ -292,14 +300,26 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
   result.prompt_tokens = prompt.size();
 
   std::vector<std::int32_t> generated;
+  // Generated tokens not yet reported with a text piece.
+  std::vector<std::int32_t> unreported;
   std::string visible;
+  // The decoded reply and where an unterminated tool call starts in it.
+  std::string decoded;
+  std::size_t held = std::string::npos;
   std::size_t emitted = 0;
   bool stopped = false, consumer_cancelled = false;
+  const auto report_ids = [&] {
+    if (on_token_ids && !unreported.empty()) {
+      on_token_ids(unreported);
+      unreported.clear();
+    }
+  };
   const auto emit = [&](std::size_t end) {
     if (end <= emitted)
       return true;
     const std::string piece = visible.substr(emitted, end - emitted);
     emitted = end;
+    report_ids();
     if (on_token && !on_token(piece)) {
       consumer_cancelled = true;
       return false;
@@ -314,14 +334,15 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
           return false;
         }
         generated.insert(generated.end(), block.begin(), block.end());
+        if (on_token_ids)
+          unreported.insert(unreported.end(), block.begin(), block.end());
         // Specials stay in the text: native tool calls use them as framing.
-        std::size_t held = std::string::npos;
-        visible = dg::NativeToolCallsToXml(
+        decoded =
             thinking == Thinking::kTagged
                 ? DecodeTaggedThinking(tokenizer, generated, open, close)
                 : tokenizer.Decode(
-                      dg::StripThinkingTokens(generated, open, close), false),
-            &held);
+                      dg::StripThinkingTokens(generated, open, close), false);
+        visible = dg::NativeToolCallsToXml(decoded, &held);
         std::size_t cut = std::string::npos;
         for (const auto& stop : stop_sequences) {
           const std::size_t from =
@@ -346,8 +367,19 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
   // A matched stop sequence ends generation through the block callback,
   // which the engine reports as cancellation.
   consumer_cancelled = consumer_cancelled || (stats.cancelled && !stopped);
-  if (!stopped && !consumer_cancelled)
+  if (!stopped && !consumer_cancelled) {
+    // A call left unterminated at the end of the reply stays visible as text
+    // rather than vanishing.
+    if (held != std::string::npos)
+      visible += decoded.substr(held);
     (void)emit(visible.size());
+    // Tokens without visible text still arrive, with an empty piece.
+    if (on_token_ids && !unreported.empty()) {
+      report_ids();
+      if (on_token)
+        (void)on_token({});
+    }
+  }
 
   {
     char line[320];

@@ -19,8 +19,8 @@ namespace gufo::server {
 /// `reasoning`); the thinking channel is then returned as reasoning, and
 /// otherwise removed. Raw completions keep it as `<think>` text and accept
 /// `ignore_eos` (the end tokens are never sampled) and `cache_prompt: false`
-/// (no prompt prefix is reused). Tools are rendered in the
-/// checkpoint's native format and its calls are returned to the adapter as
+/// (no prompt prefix is reused) and `return_token_ids`. Tools are rendered in
+/// the checkpoint's native format and its calls are returned to the adapter as
 /// Qwen XML call blocks, which it parses into tool calls.
 class DiffusionGemmaBackend final : public TextGenerationBackend {
 public:
@@ -86,13 +86,15 @@ private:
                      const CancellationCheck& is_cancelled,
                      const TokenCallback& on_token, std::string_view client_id,
                      const std::vector<std::string>& stop_sequences,
-                     bool ignore_eos, bool cache_prompt);
+                     bool ignore_eos, bool cache_prompt,
+                     const TokenIdsCallback& on_token_ids = {});
   Result Run(const std::vector<std::int32_t>& prompt, std::size_t max_tokens,
              const sampling::SamplingConfig& sampling,
              const CancellationCheck& is_cancelled,
              const TokenCallback& on_token, std::string_view client_id,
              const std::vector<std::string>& stop_sequences, Thinking thinking,
-             bool ignore_eos, bool cache_prompt = true);
+             bool ignore_eos, bool cache_prompt = true,
+             const TokenIdsCallback& on_token_ids = {});
 
   std::unique_ptr<models::diffusion_gemma::Engine> engine_;
   std::string model_id_;

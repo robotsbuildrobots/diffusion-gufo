@@ -909,6 +909,14 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
+  bool return_token_ids = false;
+  if (const auto* value = body.find("return_token_ids");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest(
+          "'return_token_ids' must be a boolean");
+    return_token_ids = value->as_bool();
+  }
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -927,6 +935,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   auto generation = b.start_complete(
       prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
       req.client_id, stop_sequences, return_progress, cache_prompt);
+  if (return_token_ids && !generation->SetTokenIdsCallback({}))
+    return InvalidCompatibilityRequest(
+        "'return_token_ids' is not supported by this model");
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
   const std::string model = b.model_id();
@@ -941,9 +952,16 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     {"X-Accel-Buffering", "no"}},
         .streaming_body =
             [generation = std::move(generation), id, created, model,
-             include_usage, return_progress,
+             include_usage, return_progress, return_token_ids,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
+              // IDs reported for the next piece, sent with its chunk.
+              std::vector<std::int32_t> token_ids;
+              if (return_token_ids)
+                (void)generation->SetTokenIdsCallback(
+                    [&](std::span<const std::int32_t> ids) {
+                      token_ids.insert(token_ids.end(), ids.begin(), ids.end());
+                    });
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -959,6 +977,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
+                      if (!token_ids.empty()) {
+                        json::Value ids = json::Value::array();
+                        for (const auto token : token_ids)
+                          ids.push_back(static_cast<std::int64_t>(token));
+                        choice["token_ids"] = std::move(ids);
+                        token_ids.clear();
+                      }
                       choice["logprobs"] = json::Value();
                       choice["finish_reason"] =
                           finish_reason.empty()
@@ -1070,6 +1095,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
+  if (return_token_ids) {
+    json::Value ids = json::Value::array();
+    for (const auto token : res.tokens)
+      ids.push_back(static_cast<std::int64_t>(token));
+    c["token_ids"] = std::move(ids);
+  }
   c["logprobs"] = json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength

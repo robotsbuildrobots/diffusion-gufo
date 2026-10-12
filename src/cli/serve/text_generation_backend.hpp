@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -132,6 +133,8 @@ class TextGenerationBackend {
 public:
   using CancellationCheck = std::function<bool()>;
   using TokenCallback = std::function<bool(std::string_view)>;
+  /// The token IDs behind the next text piece (`return_token_ids`).
+  using TokenIdsCallback = std::function<void(std::span<const std::int32_t>)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -268,6 +271,12 @@ public:
     [[nodiscard]] virtual std::optional<sampling::JsonConstraint::ToolFormat>
     ToolFormat() const {
       return std::nullopt;
+    }
+    /// Before Wait: report each text piece's token IDs to `on_ids` just
+    /// before the piece. False when the backend cannot.
+    virtual bool SetTokenIdsCallback(TokenIdsCallback on_ids) {
+      (void)on_ids;
+      return false;
     }
   };
 
