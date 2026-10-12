@@ -12,6 +12,7 @@ are downloaded separately and are not part of the runtime package.
 | Qwen3-ASR 1.7B | BF16 safetensors; audio to text | [Usage](qwen3-asr/README.md) |
 | Qwen3-TTS 12Hz 1.7B | BF16 safetensors; text/reference audio to speech | [Voice modes](qwen3-tts/README.md) |
 | Qwen-Image-2.1 | BF16 safetensors; generation and image editing | [Usage](qwen-image-2.1/README.md) |
+| DiffusionGemma 26B-A4B | BF16, FP8 or NVFP4 safetensors, or Q8_0 GGUF; text (block diffusion) | [Usage and sampler](diffusiongemma/README.md) |
 | MiniMax H3 FL2VA | Pinned safetensors; text to audiovisual output | [Presets and usage](minimax-h3/README.md) |
 
 Each model folder contains:
