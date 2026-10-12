@@ -1,15 +1,79 @@
-## Gufo: DiffusionGemma quickstart (this fork)
+# Diffusion Gufo: DiffusionGemma on Strix Halo
 
-This is a fork of Gufo: the Strix Halo inference engine, which adds [DiffusionGemma 26B-A4B](docs/models/diffusiongemma/README.md),
-Google's block-diffusion Gemma 4 MoE, as a native engine served by
-`gufo serve llm`; it is proposed upstream to
-[gufo-org/gufo](https://github.com/gufo-org/gufo). It needs a Strix Halo
-(Radeon 8060S, `gfx1151`) running Linux with ROCm 7.2.3, and is built from
-source: the prebuilt images in the Quickstart below do not include it yet.
+This is a fork of [Gufo](https://github.com/gufo-org/gufo), the Strix Halo
+inference engine, that adds Google's
+[DiffusionGemma 26B-A4B](https://huggingface.co/google/diffusiongemma-26B-A4B-it):
+a Gemma 4 mixture-of-experts model that writes text by block diffusion. It
+runs as a native HIP engine on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S,
+`gfx1151`) and is served by `gufo serve llm` with an OpenAI-compatible API. For
+everything else Gufo does, see the
+[upstream README](https://github.com/gufo-org/gufo#readme).
 
 I may submit this fork to gufo, if so this fork will not be maintained.
 
-**1. Build.** Debian/Ubuntu packages shown; see
+## What this fork adds
+
+- **Engine** (`src/models/diffusion_gemma/`): a causal encoder for the prompt
+  cache and a bidirectional denoiser over 256-token canvases, with
+  self-conditioning and the checkpoint's entropy-bound sampler. Every kernel
+  is Gufo's own: dense WMMA products, flash attention for head dimensions 256
+  and 512, grouped expert GEMMs and a fused sampler. There is no tuning step,
+  and repeated runs are bit-identical.
+- **Checkpoints, loaded directly:** the original BF16 safetensors, RedHatAI
+  FP8, NVIDIA NVFP4 and Unsloth Q8_0 GGUF. Quantized experts stay quantized on
+  the GPU and are widened to BF16 inside the expert kernels, because Strix
+  Halo has no FP8 or FP4 matrix units.
+- **Server** (`src/cli/serve/diffusion_gemma_backend.*`): Chat Completions,
+  Responses and completions, streamed one canvas at a time, with function
+  tools, prompt-prefix reuse, optional thinking
+  (`chat_template_kwargs.enable_thinking`), and `ignore_eos` / `cache_prompt`
+  on raw completions.
+- **Docs:** [usage](docs/models/diffusiongemma/README.md),
+  [benchmarks](docs/models/diffusiongemma/BENCHMARKS.md),
+  [quality](docs/models/diffusiongemma/QUALITY.md) and
+  [kernel experiments](docs/models/diffusiongemma/EXPERIMENTS.md).
+
+## Results
+
+Radeon 8060S, ROCm 7.2.3, through the HTTP server, one request at a time. The
+reference is llama.cpp's DiffusionGemma server with the Q8_0 GGUF (llama.cpp
+has no FP8 type).
+
+Prefill, tok/s, book prompts:
+
+| Prompt tokens | BF16 | FP8 | NVFP4 | llama.cpp Q8_0 |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,261 | 2,901 | 3,116 | 3,443 | 978 |
+| 33,105 | 2,387 | 2,326 | 2,537 | 445 |
+| 121,294 | 1,344 | 1,329 | 1,379 | 201 |
+
+Generation, 508-token prompt and 512 tokens out:
+
+| | BF16 | FP8 | NVFP4 | llama.cpp Q8_0 |
+| --- | ---: | ---: | ---: | ---: |
+| tok/s, whole request | 52.7 | 63.7 | 81.8 | 20.7 |
+| ms per denoising step | 182 | 136 | 116 | 386 |
+
+On the SPEED-Bench prompts that
+[diffu-benching](https://github.com/iv2nl0b9v/diffu-benching) ran on an NVIDIA
+DGX Spark (GB10, vLLM, NVFP4), Gufo NVFP4 reaches 77–103% of the Spark's
+generation speed per user, with the gap closing as prompts get longer.
+
+Accuracy against Hugging Face Transformers on the original BF16 checkpoint
+(mean KL per canvas position, first denoising step) and MMLU (all 14,042
+questions, 5-shot, thinking off):
+
+| | BF16 | FP8 | NVFP4 |
+| --- | ---: | ---: | ---: |
+| KL to the reference (noise floor 0.012–0.018) | 0.022 | 0.029 | 0.070 |
+| MMLU | – | 81.1% | 80.7% |
+
+## Quickstart
+
+You need a Strix Halo running Linux with ROCm 7.2.3. Build from source:
+upstream Gufo's prebuilt images do not include DiffusionGemma.
+
+**1. Build.** The commands below use Debian/Ubuntu package names; see
 [Build from source](#build-from-source) for other systems or Nix.
 
 ```sh
@@ -23,9 +87,10 @@ cmake --build --preset release --parallel 8
 ./build/release/gufo diagnose
 ```
 
-**2. Download weights.** NVFP4 is the fastest and smallest (about 19 GB);
-FP8 and BF16 are in the [model guide](docs/models/diffusiongemma/README.md#weights).
-`hf` comes with `pip install -U huggingface_hub`.
+**2. Download weights.** NVFP4 is the fastest and smallest (about 19 GB). The
+FP8 and BF16 downloads are in the
+[model guide](docs/models/diffusiongemma/README.md#weights). `hf` comes with
+`pip install -U huggingface_hub`.
 
 ```sh
 hf download nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
@@ -34,15 +99,14 @@ hf download nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
 ```
 
 **3. Serve.** Point `--model` at the checkpoint directory. Startup takes about
-10 s from a warm page cache; stop other GPU servers first.
+10 s from a warm page cache. Stop other GPU servers first.
 
 ```sh
 ./build/release/gufo serve --port 8080 llm --model models/diffusiongemma-nvfp4 \
   --served-model-name diffusiongemma --context 131072
 ```
 
-**4. Ask it something.** Any OpenAI-compatible client works (Chat
-Completions, Responses, completions, streaming, tools). Thinking is off
+**4. Send a request.** Any OpenAI-compatible client works. Thinking is off
 unless the request turns it on:
 
 ```sh
@@ -54,136 +118,9 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
        "messages":[{"role":"user","content":"What is 17*23?"}]}'
 ```
 
-Expect about 3,400 tok/s prefill at 2K tokens of prompt and about 80 tok/s
-generation on short prompts with NVFP4. Text arrives a 256-token canvas at a
-time. Requests run one at a time, and `temperature`/`top_p` do not apply
-(the diffusion sampler replaces them). Details:
-[usage](docs/models/diffusiongemma/README.md),
-[benchmarks](docs/models/diffusiongemma/BENCHMARKS.md),
-[quality](docs/models/diffusiongemma/QUALITY.md).
-
-
-See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
-for user-facing changes and release history.
-
-> [!TIP]
-> There are two Gufo variants that haven't been merged yet: A **[Windows port](https://github.com/pixmaate/gufo)** and **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**. Check them out!
-
-## Models and benchmarks
-
-All model documentation lives under [docs/models](docs/models/README.md):
-
-| Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **656.33 tok/s pp**; up to **70.56 tok/s tg** single user and **123.00 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
-| [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4, images, AR, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | **1,702.93 tok/s pp**; up to **65.25 tok/s tg** single user and **184.74 aggregated tok/s** on 8 concurrent requests with MTP · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
-| [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
-| [DiffusionGemma 26B-A4B](docs/models/diffusiongemma/README.md) | BF16, FP8, NVFP4 or Q8_0; block diffusion | [google/diffusiongemma-26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it/tree/f7f5b7f5fa82ffc52addd066915886d497f5517b) · [FP8](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic/tree/3b3dae4697494da5a290e9c0461954449e76c4f5) · [NVFP4](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4/tree/ec4ff3df205028f4e81c954c2227f9312b3ec2ea) | FP8: **3,116 tok/s pp** at 2K, **63.7 tok/s** generation on a short prompt (256-token canvases; speed depends on the text) · [Benchmarks](docs/models/diffusiongemma/BENCHMARKS.md) | [Quality](docs/models/diffusiongemma/QUALITY.md) |
-| [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
-| [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
-| [Qwen-Image-2.1](docs/models/qwen-image-2.1/README.md) | BF16 image generation and editing | [Complete pipeline](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | In progress · [Benchmarks](docs/models/qwen-image-2.1/BENCHMARKS.md) | [Quality](docs/models/qwen-image-2.1/QUALITY.md) |
-| [MiniMax H3](docs/models/minimax-h3/README.md) | BF16 text to video/audio | [FL2VA pipeline](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA) | In progress · [Benchmarks](docs/models/minimax-h3/BENCHMARKS.md) | [Quality](docs/models/minimax-h3/QUALITY.md) |
-
-Peak measured workloads; text pp is autoregressive (AR), while tg uses the
-named speculative mode. Peaks include repetitive output; aggregate tg sums
-individual request decode rates. Qwen27B's single-user peak uses the short-prompt
-C1 workload. Audio excludes loading.
-Each model guide lists the required files and complete benchmark settings.
-
-## Philosophy
-
-- Contributions are welcome! We need the help of Strix Halo community to keep improving gufo!
-- We would like this to be the one-stop shop for Strix Halo Local AI enthusiasts: batteries included for text, audio, image, and video models.
-- Build and optimize specifically for the Strix Halo 128 GiB hardware. Smaller memory configurations should still work and preserve the speed benefits for models that can fit on memory.
-- Support only the best available models for their size that can run on this hardware: less code to maintain, more focused optimization and testing work.
-- Preserve quality when optimizing. Each model's quality report records independent numerical checks, execution consistency and unresolved gaps. Don't reuse kernels across different models to limit blast radius of a code change.
-- Treat concurrent requests, cancellation and conversation caching as first-class workloads.
-- Keep production dependencies small and development tools separate.
-
-## Quickstart
-
-```sh
-hf download unsloth/Qwen3.8-27B-GGUF \
-  Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --revision 4ca720788d1e01f1bff70c033e0d0028fd02e502 \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-GGUF
-hf download z-lab/Qwen3.8-27B-DFlash2-GGUF \
-  Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  --revision 2d9571f8ce46e151f61c6499c99dee6079e1d610 \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-DFlash2-GGUF
-podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
-podman run --rm \
-  --userns=keep-id:uid=1000,gid=1000 \
-  --device /dev/kfd \
-  --device /dev/dri \
-  --group-add keep-groups \
-  --ulimit memlock=-1 \
-  -p 8080:8080 \
-  -v ./models:/models:ro \
-  ghcr.io/gufo-org/toolboxes/gufo-runtime:latest \
-  gufo serve --host 0.0.0.0 --port 8080 llm \
-  --model /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --speculative dflash2 \
-  --dflash-model /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-```
-
-Rootless Podman needs `crun` for `--group-add keep-groups`. Your host user must
-have read/write access to `/dev/kfd` and `/dev/dri/renderD*`, usually through the
-`render` and `video` groups; log out and back in after changing membership.
-Container groups named `video`/`render` do not preserve host supplementary
-groups. Check `id`, `ls -l /dev/kfd /dev/dri/renderD*`, and
-`podman info --format '{{.Host.OCIRuntime.Name}}'` if ROCm reports no device.
-See [Podman's rootless group-access guidance](https://github.com/containers/podman/blob/main/troubleshooting.md#20-passed-in-devices-or-files-cant-be-accessed-in-rootless-container).
-
-On Fedora or another SELinux-enforcing host, GPU enumeration can succeed while
-SELinux blocks mapping `/dev/kfd`, causing ROCr to report a misleading
-“Memory critical” error. Check the **host** audit log:
-
-```sh
-sudo ausearch -m avc -ts recent | grep -E '/dev/kfd|hsa_device_t'
-```
-
-If it shows a denied `map` for the container, Podman documents this fix:
-
-```sh
-sudo setsebool -P container_use_devices true
-```
-
-This persistently allows containers to access device labels for devices passed
-into them; it affects all containers on that host. Review that policy scope
-before enabling it. See [Podman's device documentation](https://docs.podman.io/en/latest/markdown/podman-run.1.html#device-host-device-container-device-permissions)
-and the [SELinux container policy](https://github.com/containers/container-selinux/blob/main/container.te).
-
-Then, from another terminal, ask it something through the OpenAI-compatible API:
-
-```sh
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-27B-UD-Q8_K_XL",
-    "messages": [{"role": "user", "content": "Say something"}]
-  }'
-```
-
-For Open WebUI, VS Code, OpenAI SDK and Responses-API clients (for example
-Codex), set the API base URL to `http://localhost:8080/v1`. Chat Completions and
-Responses support text, images, function tools, structured output and streaming.
-See the [API contract](docs/SERVER.md).
-
-The text server uses the model's native context by default and generates until
-EOS or the context is full. `--context N` sets context capacity per session;
-`--max-tokens N` sets a default response limit that clients can override.
-Reasoning tokens count toward that response limit.
-
-## Harness notes
-
-- **Qwen with Codex:** Codex sends developer messages mid-conversation, after
-  compaction or a settings change. Qwen's template accepts only one leading
-  system turn, so Gufo moves them there. The request that introduces one is
-  prefilled again; later requests reuse the cache. See the
-  [API contract](docs/SERVER.md).
+Text arrives a 256-token canvas at a time, and requests run one at a time.
+`temperature` and `top_p` do not apply, because the diffusion sampler
+replaces them.
 
 ## Build from source
 
