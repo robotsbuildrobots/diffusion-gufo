@@ -16,8 +16,10 @@ namespace gufo::models::diffusion_gemma {
 struct EngineOptions {
   /// Largest prompt plus generated length; sizes the global-layer KV cache.
   int max_context{131072};
-  /// Prompt tokens per encoder pass.
-  int prefill_chunk{2048};
+  /// Prompt tokens per encoder pass. Larger chunks give the expert products
+  /// fuller row groups; each prompt row costs about 390 KB of scratch and
+  /// sliding-layer cache.
+  int prefill_chunk{8192};
   /// Print per-phase GPU time for each request to stderr.
   bool profile{false};
 };

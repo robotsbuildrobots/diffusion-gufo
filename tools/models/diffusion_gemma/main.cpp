@@ -137,7 +137,8 @@ dg::EngineOptions EngineOptionsFrom(
     const std::map<std::string, std::string>& flags) {
   dg::EngineOptions options;
   options.max_context = std::stoi(Flag(flags, "max-context", "131072"));
-  options.prefill_chunk = std::stoi(Flag(flags, "chunk", "2048"));
+  options.prefill_chunk = std::stoi(
+      Flag(flags, "chunk", std::to_string(dg::EngineOptions{}.prefill_chunk)));
   options.profile = flags.contains("profile");
   return options;
 }
