@@ -64,7 +64,10 @@ def main():
     check(["serve", "help", "unknown"], 2, "unknown serve command")
     help_text = check(["serve", "llm", "--help"], 0, "model native context")
     assert "-1 = until EOS or context full" in help_text
-    assert "Path to GGUF model file (required)" in help_text
+    assert (
+        "GGUF model file, or a DiffusionGemma checkpoint directory (required)"
+        in help_text
+    )
     assert "8589934592" in help_text
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text

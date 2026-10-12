@@ -293,6 +293,9 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  /// False when the backend cannot constrain output to a JSON schema
+  /// (response_format / text.format); such requests are rejected with 400.
+  [[nodiscard]] virtual bool supports_response_format() const { return true; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }

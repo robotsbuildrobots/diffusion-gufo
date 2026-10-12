@@ -32,6 +32,10 @@
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/image_api.hpp"
+#if defined(ENGINE_ENABLE_HIP)
+#include "src/cli/serve/diffusion_gemma_backend.hpp"
+#include "src/models/diffusion_gemma/config.hpp"
+#endif
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
@@ -620,8 +624,10 @@ void PrintServeHelp(std::string_view program_name,
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
 
     // Model & Context
-    parser.AddOption("-m", "--model", "PATH",
-                     "Path to GGUF model file (required)", "Model", &model);
+    parser.AddOption(
+        "-m", "--model", "PATH",
+        "GGUF model file, or a DiffusionGemma checkpoint directory (required)",
+        "Model", &model);
     parser.AddOption("", "--mmproj", "PATH",
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
@@ -933,7 +939,7 @@ int RunServe(std::span<const char* const> args) {
   };
   std::string parse_err;
 
-  std::shared_ptr<server::InferenceBackend> backend;
+  std::shared_ptr<server::TextGenerationBackend> backend;
   std::shared_ptr<server::VideoJobService> video_jobs;
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
@@ -1162,8 +1168,10 @@ int RunServe(std::span<const char* const> args) {
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
-    llm_parser.AddOption("-m", "--model", "PATH",
-                         "Path to GGUF model file (required)", "Model", &model);
+    llm_parser.AddOption(
+        "-m", "--model", "PATH",
+        "GGUF model file, or a DiffusionGemma checkpoint directory (required)",
+        "Model", &model);
     llm_parser.AddOption(
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
@@ -1390,90 +1398,137 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
-    std::string err;
-    ModelLoadLog load_log("text", model);
-    backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
-                       server::TextPrefillPolicy{
-                           .decode_active_tokens = prefill_chunk_tokens,
-                       },
-                       server::TextSchedulerPolicy{
-                           .max_pending_requests = max_pending_requests,
-                           .max_pending_requests_per_client =
-                               max_pending_requests_per_client,
-                           .max_output_bytes_per_request = max_output_bytes,
-                           .max_buffered_output_bytes_per_request =
-                               max_buffered_output_bytes,
-                           .max_buffered_output_bytes_total =
-                               max_buffered_output_bytes_total,
-                           .request_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       request_timeout_ms)},
-                           .stall_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       stall_timeout_ms)},
-                           .log_progress = log_progress,
-                       },
-                       speculative_config,
-                       server::TextDiskCacheConfig{
-                           .directory = cache_disk_directory,
-                           .capacity_bytes = cache_disk_bytes,
-                           .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
-      std::cerr << "Error loading model '" << model << "': " << err << "\n";
-      return 1;
+#if defined(ENGINE_ENABLE_HIP)
+    const bool diffusion_gemma =
+        models::diffusion_gemma::IsDiffusionGemmaDirectory(model);
+#else
+    const bool diffusion_gemma = false;
+#endif
+    if (diffusion_gemma) {
+#if defined(ENGINE_ENABLE_HIP)
+      ModelLoadLog load_log("diffusion_gemma", model);
+      const std::string name =
+          served_model_name.empty()
+              ? std::filesystem::path(model).filename().string()
+              : served_model_name;
+      std::shared_ptr<server::DiffusionGemmaBackend> diffusion;
+      try {
+        diffusion = std::make_shared<server::DiffusionGemmaBackend>(
+            model,
+            models::diffusion_gemma::EngineOptions{
+                .max_context =
+                    max_context == 0
+                        ? models::diffusion_gemma::EngineOptions{}.max_context
+                        : static_cast<int>(max_context)},
+            name);
+      } catch (const std::exception& error) {
+        std::cerr << "Error loading DiffusionGemma '" << model
+                  << "': " << error.what() << "\n";
+        return 1;
+      }
+      diffusion->set_default_max_tokens(
+          max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens));
+      const double warmup_ms = diffusion->Warmup();
+      server::Logger::Info("loader", "event=warmup kind=diffusion_gemma ms=" +
+                                         std::to_string(warmup_ms));
+      load_log.Complete("model=" + diffusion->model_id() +
+                        " sessions=1 context_tokens=" +
+                        std::to_string(diffusion->max_context()) +
+                        " sampler=block-diffusion");
+      backend = diffusion;
+#endif
+    } else {
+      std::string err;
+      ModelLoadLog load_log("text", model);
+      auto inference = std::make_shared<server::InferenceBackend>();
+      backend = inference;
+      if (!inference->load(
+              model, &err, max_context, session_count,
+              server::TextPrefillPolicy{
+                  .decode_active_tokens = prefill_chunk_tokens,
+              },
+              server::TextSchedulerPolicy{
+                  .max_pending_requests = max_pending_requests,
+                  .max_pending_requests_per_client =
+                      max_pending_requests_per_client,
+                  .max_output_bytes_per_request = max_output_bytes,
+                  .max_buffered_output_bytes_per_request =
+                      max_buffered_output_bytes,
+                  .max_buffered_output_bytes_total =
+                      max_buffered_output_bytes_total,
+                  .request_timeout =
+                      std::chrono::milliseconds{
+                          static_cast<std::chrono::milliseconds::rep>(
+                              request_timeout_ms)},
+                  .stall_timeout =
+                      std::chrono::milliseconds{
+                          static_cast<std::chrono::milliseconds::rep>(
+                              stall_timeout_ms)},
+                  .log_progress = log_progress,
+              },
+              speculative_config,
+              server::TextDiskCacheConfig{
+                  .directory = cache_disk_directory,
+                  .capacity_bytes = cache_disk_bytes,
+                  .staging_capacity_bytes = cache_disk_staging_bytes,
+                  .model_artifact_fingerprint = {},
+              },
+              vision_model_path,
+              server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                    cache_ram_bytes})) {
+        std::cerr << "Error loading model '" << model << "': " << err << "\n";
+        return 1;
+      }
+      inference->set_model_id(served_model_name);
+      inference->set_sampling_defaults(
+          max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
+          sampling_config, SamplingOptionsSupplied(llm_parser));
+      inference->set_reasoning_defaults(*reasoning_defaults);
+      const auto effective_sampling =
+          inference->sampling_defaults().Resolve(reasoning_defaults->enabled);
+      server::ChatRequest default_request;
+      default_request.reasoning = *reasoning_defaults;
+      const auto initial_output =
+          inference->initial_output_state(default_request);
+      std::ostringstream sampling_log;
+      sampling_log << "event=defaults thinking="
+                   << (initial_output == server::TextGenerationBackend::
+                                             InitialOutputState::kReasoning
+                           ? "on"
+                       : initial_output == server::TextGenerationBackend::
+                                               InitialOutputState::kContent
+                           ? "off"
+                           : "auto")
+                   << " temperature=" << effective_sampling.temperature
+                   << " top_k=" << effective_sampling.top_k
+                   << " top_p=" << effective_sampling.top_p
+                   << " min_p=" << effective_sampling.min_p
+                   << " min_keep=" << effective_sampling.min_keep
+                   << " seed=" << effective_sampling.seed
+                   << " repeat_penalty=" << effective_sampling.repeat_penalty
+                   << " repeat_last_n=" << effective_sampling.repeat_last_n
+                   << " frequency_penalty="
+                   << effective_sampling.frequency_penalty
+                   << " presence_penalty="
+                   << effective_sampling.presence_penalty;
+      server::Logger::Info("sampling", sampling_log.str());
+      const char* speculation =
+          speculative_config.backend == server::TextSpeculativeBackend::kDFlash
+              ? "dflash2"
+          : speculative_config.backend ==
+                  server::TextSpeculativeBackend::kDSpark
+              ? "dspark"
+          : speculative_config.backend == server::TextSpeculativeBackend::kMtp
+              ? "mtp"
+              : "off";
+      load_log.Complete(
+          "model=" + inference->model_id() +
+          " sessions=" + std::to_string(session_count) +
+          " context_tokens=" + std::to_string(inference->max_context()) +
+          " speculative=" + speculation + " draft_limit=" +
+          std::to_string(speculative_config.max_draft_tokens) +
+          " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
     }
-    backend->set_model_id(served_model_name);
-    backend->set_sampling_defaults(
-        max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
-        sampling_config, SamplingOptionsSupplied(llm_parser));
-    backend->set_reasoning_defaults(*reasoning_defaults);
-    const auto effective_sampling =
-        backend->sampling_defaults().Resolve(reasoning_defaults->enabled);
-    server::ChatRequest default_request;
-    default_request.reasoning = *reasoning_defaults;
-    const auto initial_output = backend->initial_output_state(default_request);
-    std::ostringstream sampling_log;
-    sampling_log
-        << "event=defaults thinking="
-        << (initial_output == server::TextGenerationBackend::
-                                  InitialOutputState::kReasoning
-                ? "on"
-            : initial_output ==
-                    server::TextGenerationBackend::InitialOutputState::kContent
-                ? "off"
-                : "auto")
-        << " temperature=" << effective_sampling.temperature
-        << " top_k=" << effective_sampling.top_k
-        << " top_p=" << effective_sampling.top_p
-        << " min_p=" << effective_sampling.min_p
-        << " min_keep=" << effective_sampling.min_keep
-        << " seed=" << effective_sampling.seed
-        << " repeat_penalty=" << effective_sampling.repeat_penalty
-        << " repeat_last_n=" << effective_sampling.repeat_last_n
-        << " frequency_penalty=" << effective_sampling.frequency_penalty
-        << " presence_penalty=" << effective_sampling.presence_penalty;
-    server::Logger::Info("sampling", sampling_log.str());
-    const char* speculation =
-        speculative_config.backend == server::TextSpeculativeBackend::kDFlash
-            ? "dflash2"
-        : speculative_config.backend == server::TextSpeculativeBackend::kDSpark
-            ? "dspark"
-        : speculative_config.backend == server::TextSpeculativeBackend::kMtp
-            ? "mtp"
-            : "off";
-    load_log.Complete(
-        "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(backend->max_context()) + " speculative=" + speculation +
-        " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
   }
 
   // run() joins every request thread, so no hook call outlives it.

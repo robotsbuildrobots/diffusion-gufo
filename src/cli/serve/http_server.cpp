@@ -1102,6 +1102,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   chat.reasoning = b.reasoning_defaults();
   if (auto error = ParseOpenAiResponseControls(body, &chat))
     return std::move(*error);
+  if (chat.response_format && !b.supports_response_format())
+    return Err(400, "Bad Request", "text.format is not supported by this model",
+               "invalid_request_error", "unsupported_response_format");
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
   if (auto error = ReadCompatibilityOptions(

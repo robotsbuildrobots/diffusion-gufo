@@ -842,6 +842,11 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", error.what(), "invalid_response_format");
   }
+  if (output->chat.response_format && !backend.supports_response_format()) {
+    return Error(400, "Bad Request",
+                 "response_format is not supported by this model",
+                 "unsupported_response_format");
+  }
   output->chat.client_id = request.client_id;
   // As in llama-server, null keeps the default.
   if (const auto* cache_prompt = body.find("cache_prompt");
