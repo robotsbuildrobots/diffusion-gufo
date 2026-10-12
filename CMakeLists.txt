@@ -177,6 +177,7 @@ target_link_libraries(gufo_core PUBLIC ICU::uc ICU::i18n Threads::Threads
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
+add_subdirectory(src/models/diffusion_gemma)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
@@ -348,6 +349,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/qwen27b)
   gufo_qwen3_asr_register_tests()
   gufo_qwen_image_21_register_tests()
+  gufo_diffusion_gemma_register_tests()
 
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES
