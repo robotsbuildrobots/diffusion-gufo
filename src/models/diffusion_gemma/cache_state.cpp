@@ -20,7 +20,7 @@ CacheState::Pass CacheState::SlidingPass() const {
           .first_position = length_ - sliding_valid_ + skip};
 }
 
-int CacheState::Reuse(std::span<const std::int32_t> prompt) {
+int CacheState::ReusableLength(std::span<const std::int32_t> prompt) const {
   const int limit = std::min<int>(length_, static_cast<int>(prompt.size()));
   int reuse = 0;
   while (reuse < limit && tokens_[reuse] == prompt[reuse])
@@ -28,7 +28,14 @@ int CacheState::Reuse(std::span<const std::int32_t> prompt) {
   // The sliding layers continue at `reuse` only if they still hold the
   // window before it.
   const int window_start = reuse - std::min(reuse, sliding_window_ - 1);
-  if (reuse == 0 || window_start < length_ - sliding_valid_) {
+  if (reuse == 0 || window_start < length_ - sliding_valid_)
+    return 0;
+  return reuse;
+}
+
+int CacheState::Reuse(std::span<const std::int32_t> prompt) {
+  const int reuse = ReusableLength(prompt);
+  if (reuse == 0) {
     Clear();
     return 0;
   }

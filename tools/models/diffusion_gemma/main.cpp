@@ -11,18 +11,24 @@
 //                              [--reps 3] [--json OUT]
 //   gufo-diffusion-gemma logits --model DIR --prompt-ids F --canvas-ids F
 //                               --canvas2-ids F --out FILE
+//   gufo-diffusion-gemma throughput --model DIR --corpus FILE
+//                                   [--context 2048] [--sessions 4]
+//                                   [--requests 16] [--gen-tokens 1024]
 //
-// Engine commands also take [--max-context N] [--chunk N] and [--profile]
-// (per-phase GPU time on stderr).
+// Engine commands also take [--max-context N] [--chunk N] [--sessions N]
+// and [--profile] (per-phase GPU time on stderr).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/core/json.hpp"
@@ -139,6 +145,7 @@ dg::EngineOptions EngineOptionsFrom(
   options.max_context = std::stoi(Flag(flags, "max-context", "131072"));
   options.prefill_chunk = std::stoi(
       Flag(flags, "chunk", std::to_string(dg::EngineOptions{}.prefill_chunk)));
+  options.sessions = std::stoi(Flag(flags, "sessions", "1"));
   options.profile = flags.contains("profile");
   return options;
 }
@@ -192,21 +199,22 @@ int Generate(const std::map<std::string, std::string>& flags) {
   return 0;
 }
 
-// Prompt of exactly `context` tokens: a user turn holding the corpus prefix
-// and a continuation instruction, then the open model turn.
+// Prompt of exactly `context` tokens: a user turn holding the corpus from
+// `offset` and a continuation instruction, then the open model turn.
 std::vector<std::int32_t> ContextPrompt(const dg::Tokenizer& tokenizer,
                                         const std::vector<std::int32_t>& corpus,
-                                        int context) {
+                                        int context, std::size_t offset = 0) {
   const auto head = tokenizer.Encode("<bos><|turn>user\n");
   const auto tail = tokenizer.Encode(
       "\n\nContinue the story above in the same style. Write at least 800 "
       "words of new narrative prose; do not summarise.<turn|>\n<|turn>model\n");
   const int body = context - static_cast<int>(head.size() + tail.size());
-  if (body <= 0 || body > static_cast<int>(corpus.size()))
+  if (body <= 0 || offset + body > corpus.size())
     throw std::invalid_argument("corpus too short for context " +
                                 std::to_string(context));
   std::vector<std::int32_t> prompt = head;
-  prompt.insert(prompt.end(), corpus.begin(), corpus.begin() + body);
+  prompt.insert(prompt.end(), corpus.begin() + offset,
+                corpus.begin() + offset + body);
   prompt.insert(prompt.end(), tail.begin(), tail.end());
   return prompt;
 }
@@ -324,12 +332,72 @@ int Bench(const std::map<std::string, std::string>& flags) {
   return 0;
 }
 
+// Concurrent fixed-length requests (the end tokens are never sampled), each
+// on its own corpus slice so that none reuses another's prompt: aggregate
+// output throughput and per-request latency at a given session count.
+int Throughput(const std::map<std::string, std::string>& flags) {
+  const int context = std::stoi(Flag(flags, "context", "2048"));
+  const int requests = std::stoi(Flag(flags, "requests", "16"));
+  const int gen_tokens = std::stoi(Flag(flags, "gen-tokens", "1024"));
+  auto engine_options = EngineOptionsFrom(flags);
+  engine_options.max_context =
+      std::max(engine_options.max_context, context + gen_tokens + 256);
+  dg::Engine engine(Flag(flags, "model"), engine_options);
+  const auto& tokenizer = engine.tokenizer();
+  const auto corpus = tokenizer.Encode(ReadText(Flag(flags, "corpus")));
+  std::cerr << "warmup " << engine.Warmup() / 1000.0 << " s\n";
+  const std::size_t stride =
+      (corpus.size() - static_cast<std::size_t>(context)) /
+      std::max(1, requests);
+  std::vector<std::vector<std::int32_t>> prompts;
+  for (int i = 0; i < requests; ++i)
+    prompts.push_back(ContextPrompt(tokenizer, corpus, context, i * stride));
+  std::vector<dg::GenerationStats> stats(requests);
+  std::atomic<int> next{0};
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<std::thread> clients;
+  for (int s = 0; s < engine_options.sessions; ++s)
+    clients.emplace_back([&] {
+      for (int i = next++; i < requests; i = next++) {
+        dg::GenerationOptions options;
+        options.diffusion = engine.diffusion_defaults();
+        options.max_new_tokens = gen_tokens;
+        options.suppress_end = true;
+        options.reuse_prompt = false;
+        options.seed = 1000 + i;
+        stats[i] = engine.Generate(prompts[i], options, {});
+      }
+    });
+  for (auto& client : clients)
+    client.join();
+  const double wall =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  double tokens = 0, ttfb = 0, steps = 0, blocks = 0, denoise = 0, latency = 0;
+  for (const auto& s : stats) {
+    tokens += s.generated_tokens;
+    ttfb += s.first_block_ms / 1000.0;
+    steps += s.denoising_steps;
+    blocks += s.blocks;
+    denoise += s.denoise_ms;
+    latency += s.prefill_ms + s.denoise_ms + s.commit_ms;
+  }
+  std::printf("%8s %8s %8s %10s %10s %10s %10s %10s %10s\n", "sessions",
+              "context", "requests", "wall_s", "agg_tps", "user_tps", "ttfb_s",
+              "ms/step", "steps/blk");
+  std::printf("%8d %8d %8d %10.2f %10.1f %10.1f %10.2f %10.1f %10.1f\n",
+              engine_options.sessions, context, requests, wall, tokens / wall,
+              tokens / std::max(1e-9, latency / 1000.0), ttfb / requests,
+              denoise / std::max(1.0, steps), steps / std::max(1.0, blocks));
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: gufo-diffusion-gemma "
-                 "tokenize|render|generate|bench|logits ...\n";
+                 "tokenize|render|generate|bench|logits|throughput ...\n";
     return 2;
   }
   try {
@@ -345,6 +413,8 @@ int main(int argc, char** argv) {
       return Bench(flags);
     if (command == "logits")
       return DumpLogits(flags);
+    if (command == "throughput")
+      return Throughput(flags);
     std::cerr << "unknown command " << command << "\n";
     return 2;
   } catch (const std::exception& error) {

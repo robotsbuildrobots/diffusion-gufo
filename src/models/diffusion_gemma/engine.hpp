@@ -20,6 +20,9 @@ struct EngineOptions {
   /// fuller row groups; each prompt row costs about 390 KB of scratch and
   /// sliding-layer cache.
   int prefill_chunk{8192};
+  /// Concurrent requests. Each session holds its own KV caches; the
+  /// denoising steps of active requests run as one batched forward pass.
+  int sessions{1};
   /// Print per-phase GPU time for each request to stderr.
   bool profile{false};
 };
@@ -31,8 +34,11 @@ struct GenerationOptions {
   bool suppress_end{false};
   DiffusionDefaults diffusion;
   std::uint64_t seed{0};
-  /// Polled before every encoder chunk and denoising step; true stops the
-  /// request (GenerationStats::cancelled).
+  /// Reuse the longest prompt prefix a free session's cache holds; false
+  /// encodes the whole prompt.
+  bool reuse_prompt{true};
+  /// Polled while the request runs (from the calling thread); true stops it
+  /// (GenerationStats::cancelled).
   std::function<bool()> cancelled;
 };
 
@@ -50,7 +56,10 @@ struct GenerationStats {
   bool cancelled{false};
 };
 
-/// Single-session DiffusionGemma block-diffusion engine on gfx1151.
+/// DiffusionGemma block-diffusion engine on gfx1151. Generate may be
+/// called from several threads: requests wait for a free session, prompt
+/// chunks run one at a time between denoising steps, and the denoising steps
+/// of all active requests run as one batched forward pass.
 class Engine {
 public:
   /// Called once per accepted canvas with the tokens it contributes (EOS and
@@ -68,10 +77,11 @@ public:
   [[nodiscard]] int max_context() const;
   [[nodiscard]] std::size_t weight_bytes() const;
 
-  /// Generates a reply to `prompt`. The longest prefix it shares with the
-  /// cached tokens (the previous prompt and its reply's committed canvases)
-  /// is reused when the sliding layers still hold the window before it;
-  /// only the rest is encoded.
+  /// Generates a reply to `prompt` in a free session: the one whose cache
+  /// (a previous prompt and its reply's committed canvases) shares the
+  /// longest reusable prefix with it, else the least recently used. The
+  /// prefix is reused when the sliding layers still hold the window before
+  /// it; only the rest is encoded. `on_block` runs on the calling thread.
   GenerationStats Generate(std::span<const std::int32_t> prompt,
                            const GenerationOptions& options,
                            const BlockCallback& on_block);
@@ -81,8 +91,9 @@ public:
   /// returns elapsed milliseconds.
   double Warmup();
 
-  // Benchmark primitives. Reset() empties the cache; Encode() appends tokens
-  // through the causal encoder and returns elapsed milliseconds.
+  // Benchmark primitives, on the first session while no request runs.
+  // Reset() empties every cache; Encode() appends tokens through the causal
+  // encoder and returns elapsed milliseconds.
   void Reset();
   double Encode(std::span<const std::int32_t> tokens);
   [[nodiscard]] int cached_tokens() const;

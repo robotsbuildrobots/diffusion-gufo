@@ -113,11 +113,29 @@ void Reuse() {
   }
 }
 
+// ReusableLength reports what Reuse would keep and leaves the cache alone.
+void ReusableLength() {
+  auto cache = Make();
+  (void)cache.Append(Tokens(0, 15));
+  auto within = Tokens(0, 20);
+  within[12] = 100;
+  auto beyond = Tokens(0, 20);
+  beyond[10] = 100;
+  Expect(cache.ReusableLength(Tokens(0, 20)) == 15, "full prefix reusable");
+  Expect(cache.ReusableLength(within) == 12, "reusable up to the divergence");
+  Expect(cache.ReusableLength(beyond) == 0, "nothing beyond the history");
+  Expect(cache.length() == 15 && cache.sliding_valid() == 11 &&
+             cache.tokens().size() == 15,
+         "query leaves the cache unchanged");
+  Expect(cache.Reuse(within) == 12, "Reuse agrees with the query");
+}
+
 }  // namespace
 
 int main() {
   Appends();
   Reuse();
+  ReusableLength();
   if (failures == 0)
     std::printf("diffusion_gemma_cache_state_test: OK\n");
   return failures == 0 ? 0 : 1;

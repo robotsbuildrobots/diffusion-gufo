@@ -44,6 +44,8 @@ public:
   /// returns its length. Clears the cache and returns 0 when no prefix can
   /// be reused.
   int Reuse(std::span<const std::int32_t> prompt);
+  /// What Reuse(prompt) would keep, without changing the cache.
+  [[nodiscard]] int ReusableLength(std::span<const std::int32_t> prompt) const;
 
   /// Records an encoder pass over `tokens`. The sliding caches must then
   /// move slots [from, from + count) to slot 0.

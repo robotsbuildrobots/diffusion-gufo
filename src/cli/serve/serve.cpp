@@ -1419,7 +1419,8 @@ int RunServe(std::span<const char* const> args) {
                 .max_context =
                     max_context == 0
                         ? models::diffusion_gemma::EngineOptions{}.max_context
-                        : static_cast<int>(max_context)},
+                        : static_cast<int>(max_context),
+                .sessions = static_cast<int>(session_count)},
             name);
       } catch (const std::exception& error) {
         std::cerr << "Error loading DiffusionGemma '" << model
@@ -1431,8 +1432,8 @@ int RunServe(std::span<const char* const> args) {
       const double warmup_ms = diffusion->Warmup();
       server::Logger::Info("loader", "event=warmup kind=diffusion_gemma ms=" +
                                          std::to_string(warmup_ms));
-      load_log.Complete("model=" + diffusion->model_id() +
-                        " sessions=1 context_tokens=" +
+      load_log.Complete("model=" + diffusion->model_id() + " sessions=" +
+                        std::to_string(session_count) + " context_tokens=" +
                         std::to_string(diffusion->max_context()) +
                         " sampler=block-diffusion");
       backend = diffusion;

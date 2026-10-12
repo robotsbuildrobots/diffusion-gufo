@@ -261,10 +261,6 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
     Thinking thinking, bool ignore_eos, bool cache_prompt,
     const TokenIdsCallback& on_token_ids) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  // Without prompt caching the request encodes its whole prompt.
-  if (!cache_prompt)
-    engine_->Reset();
   const auto& tokenizer = engine_->tokenizer();
   const int room = engine_->max_context() - static_cast<int>(prompt.size());
   if (room < engine_->config().canvas)
@@ -282,6 +278,8 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
   options.diffusion = engine_->diffusion_defaults();
   options.max_new_tokens = static_cast<int>(max_tokens);
   options.suppress_end = ignore_eos;
+  // Without prompt caching the request encodes its whole prompt.
+  options.reuse_prompt = cache_prompt;
   options.seed = sampling.seed >= 0 ? static_cast<std::uint64_t>(sampling.seed)
                                     : std::random_device{}() * 0x100000001ULL;
 
@@ -296,7 +294,7 @@ TextGenerationBackend::Result DiffusionGemmaBackend::Run(
 
   Result result;
   result.client_id = std::string(client_id);
-  result.execution_plan = "diffusion-c1";
+  result.execution_plan = "diffusion";
   result.prompt_tokens = prompt.size();
 
   std::vector<std::int32_t> generated;

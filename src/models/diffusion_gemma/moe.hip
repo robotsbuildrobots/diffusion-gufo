@@ -167,10 +167,10 @@ __global__ void __launch_bounds__(kRowsT * 4)
   constexpr bool kQ8 = kFormat == kWeightsQ8;
   constexpr bool kFp4 = kFormat == kWeightsFp4;
   constexpr bool kBytes = kFormat == kWeightsQ8 || kFormat == kWeightsFp8;
-  // Waves: kWM row strips of 32 rows x 4 column groups of 32 columns, so
-  // 128-row groups run 16 waves with the 64-row kernel's registers per wave.
+  // Waves: kRowsT / 32 row strips of 32 rows x 4 column groups of 32 columns,
+  // so 128-row groups run 16 waves with the 64-row kernel's registers per wave.
   constexpr int kThreads = kRowsT * 4;
-  constexpr int kWM = kRowsT / 32, kWN = 4, kNT = 2;
+  constexpr int kWN = 4, kNT = 2;
   // 64-row groups double-buffer their stages; 128-row groups use one buffer
   // (two would exceed 64 KB) with a second barrier per stage.
   constexpr int kBuffers = kRowsT == 64 ? 2 : 1;

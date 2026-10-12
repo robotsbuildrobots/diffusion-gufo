@@ -3,7 +3,6 @@
 
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <string>
 
 #include "src/cli/serve/text_generation_backend.hpp"
@@ -11,8 +10,9 @@
 
 namespace gufo::server {
 
-/// HTTP text backend for DiffusionGemma's block diffusion. One request runs
-/// at a time; output arrives a canvas (256 tokens) at a time. The diffusion
+/// HTTP text backend for DiffusionGemma's block diffusion. Up to the
+/// engine's session count of requests run at once, their denoising steps
+/// batched; output arrives a canvas (256 tokens) at a time. The diffusion
 /// sampler replaces token sampling, so temperature/top-k/top-p and penalties
 /// do not apply; `seed` makes a request reproducible. Thinking is off unless
 /// the request enables it (`chat_template_kwargs.enable_thinking` or
@@ -73,10 +73,7 @@ public:
     default_max_tokens_ = tokens;
   }
   /// See Engine::Warmup.
-  double Warmup() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return engine_->Warmup();
-  }
+  double Warmup() { return engine_->Warmup(); }
 
 private:
   /// How the thinking channel appears in the reply.
@@ -99,7 +96,6 @@ private:
   std::unique_ptr<models::diffusion_gemma::Engine> engine_;
   std::string model_id_;
   std::size_t default_max_tokens_{0};
-  std::mutex mutex_;  ///< The engine holds one session.
 };
 
 }  // namespace gufo::server
