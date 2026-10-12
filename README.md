@@ -1,22 +1,13 @@
-# Gufo: the Strix Halo inference engine
+## Gufo: DiffusionGemma quickstart (this fork)
 
-<p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
-</p>
-
-Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
-Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
-
-**Contributions are welcome!**
-
-## DiffusionGemma quickstart (this fork)
-
-This fork adds [DiffusionGemma 26B-A4B](docs/models/diffusiongemma/README.md),
+This is a fork of Gufo: the Strix Halo inference engine, which adds [DiffusionGemma 26B-A4B](docs/models/diffusiongemma/README.md),
 Google's block-diffusion Gemma 4 MoE, as a native engine served by
 `gufo serve llm`; it is proposed upstream to
 [gufo-org/gufo](https://github.com/gufo-org/gufo). It needs a Strix Halo
 (Radeon 8060S, `gfx1151`) running Linux with ROCm 7.2.3, and is built from
 source: the prebuilt images in the Quickstart below do not include it yet.
+
+I may submit this fork to gufo, if so this fork will not be maintained.
 
 **1. Build.** Debian/Ubuntu packages shown; see
 [Build from source](#build-from-source) for other systems or Nix.
