@@ -141,10 +141,13 @@ struct Engine::Impl {
 
   // The sessions of the current layer pass and their rows of the scratch
   // buffers: the attention blocks read and write each one's caches.
+  // Decoder segments (canvases) see their cache plus the whole canvas;
+  // encoder segments (prompt chunks, committed canvases) are causal.
   struct Segment {
     int row0{0};
     int rows{0};
     Session* session{nullptr};
+    bool decoder{true};
     bool staged{false};  // Sliding layers use the stage caches.
   };
   std::vector<Segment> segments;
@@ -328,7 +331,7 @@ struct Engine::Impl {
   /// Input norm, QKV, Q/K norms and RoPE (writing this pass's keys and
   /// values to each segment's caches), attention and the output projection;
   /// leaves the three feed-forward inputs (ff, ff2, rout).
-  void AttentionBlock(int l, int t, bool decoder) {
+  void AttentionBlock(int l, int t) {
     const Config& c = config;
     const auto& w = device_weights->view().layers[l];
     const bool global = c.is_global[l];
@@ -370,8 +373,8 @@ struct Engine::Impl {
           q.as<bf16_t>() + q_offset, k_cache + skip_elements,
           v_cache + skip_elements, attn.as<bf16_t>() + q_offset, segment.rows,
           c.heads, kv, hd, capacity, pass.first_slot + segment.rows - pass.skip,
-          cache.length(), pass.first_position, /*causal=*/!decoder,
-          (!decoder && !global) ? c.sliding_window : 0, stream,
+          cache.length(), pass.first_position, /*causal=*/!segment.decoder,
+          (!segment.decoder && !global) ? c.sliding_window : 0, stream,
           kernels::SplitWorkspace{.out = split_out.as<float>(),
                                   .stats = split_stats.as<float>(),
                                   .capacity = split_out.bytes() / 4,
@@ -468,13 +471,13 @@ struct Engine::Impl {
     ++expert_passes;
   }
 
-  /// Runs every layer over the `t` rows in `h`. Encoder passes are causal
-  /// and write the cache; decoder passes see the cache plus the canvas.
-  void Layers(int t, bool decoder) {
+  /// Runs every layer over the `t` rows in `h`, each segment's rows against
+  /// its own session's caches.
+  void Layers(int t) {
     const Config& c = config;
     for (int l = 0; l < c.layers; ++l) {
       const auto& w = device_weights->view().layers[l];
-      AttentionBlock(l, t, decoder);
+      AttentionBlock(l, t);
       DenseMlpBlock(l, t);
       ExpertBlock(l, t);
       profiler->Phase("finish");
@@ -508,46 +511,8 @@ struct Engine::Impl {
 
   /// One causal encoder pass over `t` tokens appended to `session`'s cache.
   void EncodeChunk(Session& session, const std::int32_t* tokens, int t) {
-    const Config& c = config;
-    const bool staged = session.cache.sliding_valid() + t > sliding_capacity;
-    HipCheck(hipMemcpyAsync(ids.as<void>(), tokens, t * 4,
-                            hipMemcpyHostToDevice, stream),
-             "token upload");
-    if (staged) {
-      for (int l = 0; l < c.layers; ++l)
-        if (!c.is_global[l]) {
-          CopyPositions(session.k_cache[l], sliding_capacity, 0, k_stage[l],
-                        stage_capacity, 0, session.cache.sliding_valid());
-          CopyPositions(session.v_cache[l], sliding_capacity, 0, v_stage[l],
-                        stage_capacity, 0, session.cache.sliding_valid());
-        }
-    }
-    segments = {
-        Segment{.row0 = 0, .rows = t, .session = &session, .staged = staged}};
-    profiler->Phase("encode_embed");
-    kernels::Embed(ids.as<std::int32_t>(), device_weights->view().embed,
-                   embed_scale, h.as<float>(), t, c.hidden, stream);
-    Layers(t, /*decoder=*/false);
-    profiler->Phase("cache_shift");
-    // Keep the newest positions at the front of the sliding caches.
-    const auto shift =
-        session.cache.Append(std::span<const std::int32_t>(tokens, t));
-    for (int l = 0; l < c.layers; ++l) {
-      if (c.is_global[l])
-        continue;
-      if (staged) {
-        CopyPositions(k_stage[l], stage_capacity, shift.from,
-                      session.k_cache[l], sliding_capacity, 0, shift.count);
-        CopyPositions(v_stage[l], stage_capacity, shift.from,
-                      session.v_cache[l], sliding_capacity, 0, shift.count);
-        continue;
-      }
-      for (auto* buffer : {&session.k_cache[l], &session.v_cache[l]})
-        kernels::ShiftCache(buffer->as<bf16_t>(), shift_scratch.as<bf16_t>(),
-                            c.sliding_kv_heads, sliding_capacity,
-                            c.sliding_head_dim, shift.from, shift.count,
-                            stream);
-    }
+    const EncodeWork work{.session = &session, .tokens = tokens, .rows = t};
+    Forward({}, std::span<const EncodeWork>(&work, 1));
   }
 
   /// Encodes `tokens` into `session`'s cache in prompt chunks of at most
@@ -581,85 +546,168 @@ struct Engine::Impl {
     std::int32_t* sample{nullptr};
   };
 
-  /// One denoiser forward over every canvas in `batch`, each after its own
-  /// session's cache, as one pass over their stacked rows; leaves per-row
-  /// entropy, argmax and a sample in each canvas's host arrays and its
-  /// self-conditioning probabilities in its session.
-  void DenoiseStep(std::span<const CanvasStep> batch) {
+  /// Causal rows appended to a session's cache: a prompt chunk or a
+  /// committed canvas.
+  struct EncodeWork {
+    Session* session{nullptr};
+    const std::int32_t* tokens{nullptr};
+    int rows{0};
+  };
+
+  void DenoiseStep(std::span<const CanvasStep> batch) { Forward(batch, {}); }
+
+  /// One forward pass over the stacked rows of `canvases` (a denoising step
+  /// each, after its own session's cache) and then `encodes` (causal rows
+  /// appended to their sessions' caches; at most one may need the stage
+  /// caches). Leaves each canvas's per-row entropy, argmax and sample in its
+  /// host arrays and its self-conditioning probabilities in its session.
+  void Forward(std::span<const CanvasStep> canvases,
+               std::span<const EncodeWork> encodes) {
     const Config& c = config;
     const auto& weights = device_weights->view();
-    const int n = c.canvas, H = c.hidden,
-              t = n * static_cast<int>(batch.size());
-    const auto row = [&](int b, int width) {
-      return static_cast<std::size_t>(b) * n * width;
-    };
-    std::vector<std::int32_t> canvas_ids(t);
-    for (std::size_t b = 0; b < batch.size(); ++b)
-      std::copy_n(batch[b].tokens, n, canvas_ids.begin() + row(b, 1));
-    HipCheck(hipMemcpyAsync(ids.as<void>(), canvas_ids.data(), t * 4,
+    const int n = c.canvas, H = c.hidden;
+    const int decode_rows = n * static_cast<int>(canvases.size());
+    int t = decode_rows;
+    for (const auto& work : encodes)
+      t += work.rows;
+    const auto row = [&](std::size_t b, int width) { return b * n * width; };
+    std::vector<std::int32_t> pass_ids;
+    pass_ids.reserve(t);
+    for (const auto& canvas : canvases)
+      pass_ids.insert(pass_ids.end(), canvas.tokens, canvas.tokens + n);
+    for (const auto& work : encodes)
+      pass_ids.insert(pass_ids.end(), work.tokens, work.tokens + work.rows);
+    HipCheck(hipMemcpyAsync(ids.as<void>(), pass_ids.data(), t * 4,
                             hipMemcpyHostToDevice, stream),
-             "canvas upload");
-    profiler->Phase("self_condition");
-    kernels::Embed(ids.as<std::int32_t>(), weights.embed, embed_scale,
-                   embeds.as<float>(), t, H, stream);
-    bool any_self_condition = false;
-    for (std::size_t b = 0; b < batch.size(); ++b) {
-      if (!batch[b].self_condition)
-        continue;
-      any_self_condition = true;
-      kernels::SoftEmbedProduct(batch[b].session->probs.as<bf16_t>(),
-                                weights.embed, soft_partials.as<float>(),
-                                soft.as<float>() + row(b, H), n, c.vocab, H,
-                                kSoftEmbedSplits, stream);
-    }
-    if (any_self_condition) {
-      // Over every row: canvases without self-conditioning ignore theirs.
-      kernels::SoftEmbedNorm(soft.as<float>(), weights.sc_pre_norm, embed_scale,
-                             soft_norm.as<bf16_t>(), t, H, c.rms_eps, stream);
-      kernels::LinearGeluMul(soft_norm.as<bf16_t>(), weights.sc_gate_up,
-                             act.as<bf16_t>(), t, c.intermediate, H, stream);
-      Dense(act.as<void>(), weights.sc_down, signal.as<float>(), t, H,
-            c.intermediate);
-    }
+             "token upload");
     segments.clear();
-    for (std::size_t b = 0; b < batch.size(); ++b) {
-      kernels::SelfConditionCombine(
-          embeds.as<float>() + row(b, H),
-          batch[b].self_condition ? signal.as<float>() + row(b, H) : nullptr,
-          h.as<float>() + row(b, H), n, H, c.rms_eps, stream);
-      segments.push_back(Segment{.row0 = static_cast<int>(row(b, 1)),
-                                 .rows = n,
-                                 .session = batch[b].session});
+    if (!canvases.empty()) {
+      profiler->Phase("self_condition");
+      kernels::Embed(ids.as<std::int32_t>(), weights.embed, embed_scale,
+                     embeds.as<float>(), decode_rows, H, stream);
+      bool any_self_condition = false;
+      for (std::size_t b = 0; b < canvases.size(); ++b) {
+        if (!canvases[b].self_condition)
+          continue;
+        any_self_condition = true;
+        kernels::SoftEmbedProduct(canvases[b].session->probs.as<bf16_t>(),
+                                  weights.embed, soft_partials.as<float>(),
+                                  soft.as<float>() + row(b, H), n, c.vocab, H,
+                                  kSoftEmbedSplits, stream);
+      }
+      if (any_self_condition) {
+        // Over every canvas row: canvases without self-conditioning ignore
+        // theirs.
+        kernels::SoftEmbedNorm(soft.as<float>(), weights.sc_pre_norm,
+                               embed_scale, soft_norm.as<bf16_t>(), decode_rows,
+                               H, c.rms_eps, stream);
+        kernels::LinearGeluMul(soft_norm.as<bf16_t>(), weights.sc_gate_up,
+                               act.as<bf16_t>(), decode_rows, c.intermediate, H,
+                               stream);
+        Dense(act.as<void>(), weights.sc_down, signal.as<float>(), decode_rows,
+              H, c.intermediate);
+      }
+      for (std::size_t b = 0; b < canvases.size(); ++b) {
+        kernels::SelfConditionCombine(
+            embeds.as<float>() + row(b, H),
+            canvases[b].self_condition ? signal.as<float>() + row(b, H)
+                                       : nullptr,
+            h.as<float>() + row(b, H), n, H, c.rms_eps, stream);
+        segments.push_back(Segment{.row0 = static_cast<int>(row(b, 1)),
+                                   .rows = n,
+                                   .session = canvases[b].session,
+                                   .decoder = true});
+      }
     }
-    Layers(t, /*decoder=*/true);
-    profiler->Phase("lm_head");
-    kernels::RmsNormToBf16(h.as<float>(), weights.final_norm, xn.as<bf16_t>(),
-                           t, H, c.rms_eps, stream);
-    Dense(xn.as<void>(), lm_head.as<bf16_t>(), logits.as<float>(), t, c.vocab,
-          H);
-    profiler->Phase("sampler");
-    for (std::size_t b = 0; b < batch.size(); ++b)
-      kernels::SampleRows(
-          logits.as<float>() + row(b, c.vocab),
-          batch[b].session->probs.as<bf16_t>(), entropy.as<float>() + row(b, 1),
-          argmax.as<std::int32_t>() + row(b, 1),
-          sample.as<std::int32_t>() + row(b, 1), n, c.vocab, c.final_softcap,
-          batch[b].temperature, batch[b].seed, batch[b].suppressed, stream);
-    profiler->Phase("readback");
-    for (std::size_t b = 0; b < batch.size(); ++b) {
-      HipCheck(hipMemcpyAsync(batch[b].entropy, entropy.as<float>() + row(b, 1),
-                              n * 4, hipMemcpyDeviceToHost, stream),
-               "readback");
-      HipCheck(
-          hipMemcpyAsync(batch[b].argmax, argmax.as<std::int32_t>() + row(b, 1),
-                         n * 4, hipMemcpyDeviceToHost, stream),
-          "readback");
-      HipCheck(
-          hipMemcpyAsync(batch[b].sample, sample.as<std::int32_t>() + row(b, 1),
-                         n * 4, hipMemcpyDeviceToHost, stream),
-          "readback");
+    int row0 = decode_rows;
+    bool stage_used = false;
+    for (const auto& work : encodes) {
+      Session& session = *work.session;
+      const bool staged =
+          session.cache.sliding_valid() + work.rows > sliding_capacity;
+      if (staged) {
+        if (stage_used)
+          throw std::logic_error("two prompt chunks need the stage caches");
+        stage_used = true;
+        for (int l = 0; l < c.layers; ++l)
+          if (!c.is_global[l]) {
+            CopyPositions(session.k_cache[l], sliding_capacity, 0, k_stage[l],
+                          stage_capacity, 0, session.cache.sliding_valid());
+            CopyPositions(session.v_cache[l], sliding_capacity, 0, v_stage[l],
+                          stage_capacity, 0, session.cache.sliding_valid());
+          }
+      }
+      profiler->Phase("encode_embed");
+      kernels::Embed(ids.as<std::int32_t>() + row0, weights.embed, embed_scale,
+                     h.as<float>() + static_cast<std::size_t>(row0) * H,
+                     work.rows, H, stream);
+      segments.push_back(Segment{.row0 = row0,
+                                 .rows = work.rows,
+                                 .session = &session,
+                                 .decoder = false,
+                                 .staged = staged});
+      row0 += work.rows;
     }
-    HipCheck(hipStreamSynchronize(stream), "denoise step");
+    Layers(t);
+    if (!canvases.empty()) {
+      profiler->Phase("lm_head");
+      kernels::RmsNormToBf16(h.as<float>(), weights.final_norm, xn.as<bf16_t>(),
+                             decode_rows, H, c.rms_eps, stream);
+      Dense(xn.as<void>(), lm_head.as<bf16_t>(), logits.as<float>(),
+            decode_rows, c.vocab, H);
+      profiler->Phase("sampler");
+      for (std::size_t b = 0; b < canvases.size(); ++b)
+        kernels::SampleRows(logits.as<float>() + row(b, c.vocab),
+                            canvases[b].session->probs.as<bf16_t>(),
+                            entropy.as<float>() + row(b, 1),
+                            argmax.as<std::int32_t>() + row(b, 1),
+                            sample.as<std::int32_t>() + row(b, 1), n, c.vocab,
+                            c.final_softcap, canvases[b].temperature,
+                            canvases[b].seed, canvases[b].suppressed, stream);
+    }
+    // The encoded rows join their caches; the sliding caches keep the
+    // newest positions at the front.
+    profiler->Phase("cache_shift");
+    for (std::size_t e = 0; e < encodes.size(); ++e) {
+      const Segment& segment = segments[canvases.size() + e];
+      Session& session = *segment.session;
+      const auto shift = session.cache.Append(
+          std::span<const std::int32_t>(encodes[e].tokens, encodes[e].rows));
+      for (int l = 0; l < c.layers; ++l) {
+        if (c.is_global[l])
+          continue;
+        if (segment.staged) {
+          CopyPositions(k_stage[l], stage_capacity, shift.from,
+                        session.k_cache[l], sliding_capacity, 0, shift.count);
+          CopyPositions(v_stage[l], stage_capacity, shift.from,
+                        session.v_cache[l], sliding_capacity, 0, shift.count);
+          continue;
+        }
+        for (auto* buffer : {&session.k_cache[l], &session.v_cache[l]})
+          kernels::ShiftCache(buffer->as<bf16_t>(), shift_scratch.as<bf16_t>(),
+                              c.sliding_kv_heads, sliding_capacity,
+                              c.sliding_head_dim, shift.from, shift.count,
+                              stream);
+      }
+    }
+    if (!canvases.empty()) {
+      profiler->Phase("readback");
+      for (std::size_t b = 0; b < canvases.size(); ++b) {
+        HipCheck(
+            hipMemcpyAsync(canvases[b].entropy, entropy.as<float>() + row(b, 1),
+                           n * 4, hipMemcpyDeviceToHost, stream),
+            "readback");
+        HipCheck(hipMemcpyAsync(canvases[b].argmax,
+                                argmax.as<std::int32_t>() + row(b, 1), n * 4,
+                                hipMemcpyDeviceToHost, stream),
+                 "readback");
+        HipCheck(hipMemcpyAsync(canvases[b].sample,
+                                sample.as<std::int32_t>() + row(b, 1), n * 4,
+                                hipMemcpyDeviceToHost, stream),
+                 "readback");
+      }
+    }
+    HipCheck(hipStreamSynchronize(stream), "forward pass");
   }
 
   // ------------------------------------------------------------ requests
@@ -680,6 +728,7 @@ struct Engine::Impl {
     std::exception_ptr error;
     // Worker only.
     enum class Phase { kPrefill, kDenoise, kDone } phase{Phase::kPrefill};
+    bool commit_pending{false};  // A finished canvas waits to be encoded.
     Session* session{nullptr};
     std::size_t encoded{0};  // Prompt tokens in the session's cache.
     std::mt19937_64 rng;
@@ -803,44 +852,113 @@ struct Engine::Impl {
     }
   }
 
-  /// One prompt chunk (the oldest request still encoding) and one batched
-  /// denoising step over every request that is denoising.
+  /// One forward pass over every request's pending work: the canvases being
+  /// denoised (one step each), then finished canvases to commit and prompt
+  /// chunks (oldest request first), within the pass's row budget.
   void Advance() {
     for (auto& job : active)
       if (job->cancel.load() && job->phase != Job::Phase::kDone) {
         job->stats.cancelled = true;
         Finish(*job);
       }
-    bool denoising = false;
-    for (const auto& job : active)
-      denoising = denoising || job->phase == Job::Phase::kDenoise;
+    const Config& c = config;
+    std::vector<Job*> stepping, committing, prefilling;
+    std::vector<int> prefill_rows;
     for (auto& job : active)
-      if (job->phase == Job::Phase::kPrefill) {
-        PrefillChunk(
-            *job, denoising ? std::min(options.prefill_chunk, kInterleavedChunk)
-                            : options.prefill_chunk);
-        break;
-      }
-    std::vector<Job*> stepping;
-    for (auto& job : active)
-      if (job->phase == Job::Phase::kDenoise)
+      if (job->phase == Job::Phase::kDenoise && !job->commit_pending)
         stepping.push_back(job.get());
-    if (!stepping.empty())
-      Step(stepping);
+    // Causal rows this pass may add: a whole prompt chunk on its own, else
+    // at most kInterleavedChunk so that denoising requests are not held up.
+    int budget = stepping.empty()
+                     ? options.prefill_chunk
+                     : std::min(options.prefill_chunk, kInterleavedChunk);
+    budget =
+        std::min(budget, rows - c.canvas * static_cast<int>(stepping.size()));
+    std::vector<EncodeWork> encodes;
+    for (auto& job : active)
+      if (job->phase == Job::Phase::kDenoise && job->commit_pending &&
+          budget >= c.canvas) {
+        encodes.push_back(EncodeWork{.session = job->session,
+                                     .tokens = job->argmax_canvas.data(),
+                                     .rows = c.canvas});
+        committing.push_back(job.get());
+        budget -= c.canvas;
+      }
+    bool staged = false;
+    for (auto& job : active) {
+      if (job->phase != Job::Phase::kPrefill)
+        continue;
+      const int remaining = static_cast<int>(job->prompt.size() - job->encoded);
+      const int take = std::min(remaining, budget);
+      if (remaining > 0 && take <= 0)
+        break;
+      // Only one chunk per pass can use the stage caches.
+      const bool needs_stage =
+          job->session->cache.sliding_valid() + take > sliding_capacity;
+      if (take > 0 && needs_stage && staged)
+        continue;
+      staged = staged || (take > 0 && needs_stage);
+      if (take > 0)
+        encodes.push_back(
+            EncodeWork{.session = job->session,
+                       .tokens = job->prompt.data() + job->encoded,
+                       .rows = take});
+      prefilling.push_back(job.get());
+      prefill_rows.push_back(take);
+      budget -= take;
+    }
+    std::vector<CanvasStep> batch;
+    for (Job* job : stepping) {
+      const DiffusionDefaults& d = job->options.diffusion;
+      // Each step draws its Gumbel noise from its own stream.
+      batch.push_back(CanvasStep{
+          .session = job->session,
+          .tokens = job->current.data(),
+          .self_condition = job->steps > 0,
+          .temperature = StepTemperature(d, d.max_denoising_steps - job->steps),
+          .seed = MixSeed(job->block_seed ^
+                          (static_cast<std::uint64_t>(job->steps) << 40)),
+          .suppressed = job->suppressed,
+          .entropy = job->row_entropy.data(),
+          .argmax = job->row_argmax.data(),
+          .sample = job->row_sample.data()});
+    }
+    const auto start = Clock::now();
+    if (!batch.empty() || !encodes.empty())
+      Forward(batch, encodes);
+    const double ms = Ms(start, Clock::now());
+    for (std::size_t i = 0; i < prefilling.size(); ++i) {
+      Job& job = *prefilling[i];
+      job.encoded += prefill_rows[i];
+      job.stats.prefill_ms += ms;
+      if (job.encoded == job.prompt.size())
+        StartGeneration(job);
+    }
+    for (Job* job : committing) {
+      job->stats.commit_ms += ms;
+      job->commit_pending = false;
+      ++job->block;
+      if (!StartBlock(*job))
+        Finish(*job);
+    }
+    std::uniform_int_distribution<std::int32_t> uniform(0, c.vocab - 1);
+    for (Job* job : stepping) {
+      const DiffusionDefaults& d = job->options.diffusion;
+      ++job->steps;
+      const auto accepted = AcceptRows(job->row_entropy, d.entropy_bound);
+      for (int i = 0; i < c.canvas; ++i)
+        job->current[i] = accepted[i] ? job->row_sample[i] : uniform(job->rng);
+      job->argmax_canvas = job->row_argmax;
+      const bool done = BlockConverged(d, job->previous_argmax, job->row_argmax,
+                                       job->row_entropy);
+      job->previous_argmax = job->row_argmax;
+      if (done || job->steps >= d.max_denoising_steps)
+        FinishBlock(*job);
+    }
   }
 
-  void PrefillChunk(Job& job, int chunk) {
-    const auto start = Clock::now();
-    if (job.encoded < job.prompt.size()) {
-      const int t = static_cast<int>(
-          std::min<std::size_t>(chunk, job.prompt.size() - job.encoded));
-      EncodeChunk(*job.session, job.prompt.data() + job.encoded, t);
-      HipCheck(hipStreamSynchronize(stream), "encode");
-      job.encoded += t;
-    }
-    job.stats.prefill_ms += Ms(start, Clock::now());
-    if (job.encoded < job.prompt.size())
-      return;
+  /// The prompt is in the cache: set up the sampler and the first canvas.
+  void StartGeneration(Job& job) {
     profiler->Report("prefill");
     const Config& c = config;
     job.rng.seed(MixSeed(job.options.seed));
@@ -878,40 +996,6 @@ struct Engine::Impl {
     return true;
   }
 
-  void Step(const std::vector<Job*>& jobs) {
-    std::vector<CanvasStep> batch;
-    for (Job* job : jobs) {
-      const DiffusionDefaults& d = job->options.diffusion;
-      // Each step draws its Gumbel noise from its own stream.
-      batch.push_back(CanvasStep{
-          .session = job->session,
-          .tokens = job->current.data(),
-          .self_condition = job->steps > 0,
-          .temperature = StepTemperature(d, d.max_denoising_steps - job->steps),
-          .seed = MixSeed(job->block_seed ^
-                          (static_cast<std::uint64_t>(job->steps) << 40)),
-          .suppressed = job->suppressed,
-          .entropy = job->row_entropy.data(),
-          .argmax = job->row_argmax.data(),
-          .sample = job->row_sample.data()});
-    }
-    DenoiseStep(batch);
-    std::uniform_int_distribution<std::int32_t> uniform(0, config.vocab - 1);
-    for (Job* job : jobs) {
-      const DiffusionDefaults& d = job->options.diffusion;
-      ++job->steps;
-      const auto accepted = AcceptRows(job->row_entropy, d.entropy_bound);
-      for (int i = 0; i < config.canvas; ++i)
-        job->current[i] = accepted[i] ? job->row_sample[i] : uniform(job->rng);
-      job->argmax_canvas = job->row_argmax;
-      const bool done = BlockConverged(d, job->previous_argmax, job->row_argmax,
-                                       job->row_entropy);
-      job->previous_argmax = job->row_argmax;
-      if (done || job->steps >= d.max_denoising_steps)
-        FinishBlock(*job);
-    }
-  }
-
   void FinishBlock(Job& job) {
     const Config& c = config;
     GenerationStats& stats = job.stats;
@@ -937,14 +1021,9 @@ struct Engine::Impl {
       Finish(job);
       return;
     }
-    // Reached only when the whole canvas belongs to the reply.
-    const auto commit_start = Clock::now();
-    EncodeChunk(*job.session, job.argmax_canvas.data(), c.canvas);
-    HipCheck(hipStreamSynchronize(stream), "commit");
-    stats.commit_ms += Ms(commit_start, Clock::now());
-    ++job.block;
-    if (!StartBlock(job))
-      Finish(job);
+    // Reached only when the whole canvas belongs to the reply: it is
+    // encoded into the cache in the next pass, then the next canvas starts.
+    job.commit_pending = true;
   }
 
   void Finish(Job& job) {
