@@ -74,8 +74,8 @@ this needed a new engine and a new server backend.
 - **JSON-schema output is rejected with a 400 error.** A diffusion sampler
   fills many positions at once, so it can't follow a grammar one token at a
   time.
-- **Requests run one at a time** under the backend's own lock. There is no
-  batching.
+- **Requests ran one at a time** under the backend's own lock, with no
+  batching. Round 2 (below) replaced this with sessions.
 
 ## Improving performance
 

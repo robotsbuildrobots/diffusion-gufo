@@ -63,6 +63,11 @@ DGX Spark (GB10, vLLM, NVFP4), Gufo NVFP4 reaches 77–82% of the Spark's
 generation speed per user, and 59–69% of its total throughput with four
 concurrent requests (`--sessions 4`); see
 [the comparison](docs/models/diffusiongemma/BENCHMARKS.md#speed-bench-against-dgx-spark-gb10).
+On literary continuation (PG19 excerpts, the
+[spark-gemma-lab](https://github.com/bodono/spark-gemma-lab) workload) NVFP4
+generates 65 tok/s, because narrative prose needs about 32 denoising steps
+per canvas against about 19 on SPEED-Bench; see
+[the PG19 results](docs/models/diffusiongemma/BENCHMARKS.md#literary-continuation-spark-gemma-lab-pg19).
 
 Accuracy against Hugging Face Transformers on the original BF16 checkpoint
 (mean KL per canvas position, first denoising step) and MMLU (all 14,042
@@ -123,7 +128,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
        "messages":[{"role":"user","content":"What is 17*23?"}]}'
 ```
 
-Text arrives a 256-token canvas at a time, and requests run one at a time.
+Text arrives a 256-token canvas at a time. Requests run one at a time unless
+the server is started with `--sessions N`, which runs up to N at once.
 `temperature` and `top_p` do not apply, because the diffusion sampler
 replaces them.
 

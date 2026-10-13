@@ -132,6 +132,35 @@ because its matrix units (about twice as fast) are not saturated by one
 canvas, while Strix Halo's are. FP8 on Strix Halo, concurrency 1, round 1, generation tok/s: 97.1 /
 88.5 / 85.8 / 71.4.
 
+## Literary continuation (spark-gemma-lab PG19)
+
+The profiling workload of
+[spark-gemma-lab](https://github.com/bodono/spark-gemma-lab) (`f6e292f`),
+measured 2026-10-13 with the round-2 build: 512-token excerpts of PG19
+test-set books (`prepare_pg19.py --count 96 --input-tokens 512`, seed 42,
+569 tokens after chat formatting), each wrapped in the lab's instruction to
+continue the passage in the same style, thinking off, natural end of text,
+`max_tokens` 512, 20 measured requests after one warm-up, one request at a
+time (`--sessions 1`, `--context 8192`). Requests and metrics come from the
+lab's own runner (`server/runner.mjs`, `server/metrics.mjs`); the one change
+to its request is dropping `ignore_eos: false`, which Gufo rejects on chat.
+Steps per canvas and ms per step are from the server's log.
+
+| Weights | Steps per canvas | ms / step | tok/s after the first canvas | tok/s per request | Time to first token s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NVFP4 | 32.5 | 116.9 | 65.4 | 66.1 | 3.95 |
+| FP8 | 30.8 | 138.0 | 59.9 | 59.1 | 4.53 |
+
+Every reply ran the full 512 tokens (two canvases). A step costs the same as
+on SPEED-Bench, but a canvas of narrative prose takes about 32 denoising
+steps to settle against about 19 on SPEED-Bench (round 2, concurrency 1, all
+lengths), so generation is about 43% slower (65 against 116 tok/s at 2K).
+The model is less certain about open-ended prose, and the entropy bound
+accepts fewer positions per step. Time to first token is almost all
+first-canvas denoising; the 569-token prompt prefills in about 0.2 s. Only
+sampler changes (fewer steps per canvas) can close this gap. The lab
+publishes no GB10 results for this workload.
+
 ## Ablation (2026-10-12, round 2)
 
 Each change alone on the round-1 build, then all retained changes, with
