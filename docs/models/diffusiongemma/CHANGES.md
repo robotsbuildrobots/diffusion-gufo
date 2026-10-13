@@ -172,3 +172,53 @@ BF16 gained more: prefill went up 25–37%.
   - MMLU: 81.1% with FP8, 80.7% with NVFP4;
   - KL divergence from the Transformers BF16 reference: 0.022 (BF16) to 0.070
     (NVFP4).
+
+## Round 2: faster prefill and concurrent requests
+
+A second pass profiled long prompts in more detail and added a way to serve
+several requests at once. Every change was measured on its own and then
+together; the numbers are in [BENCHMARKS.md](BENCHMARKS.md#ablation-2026-10-12-round-2).
+
+### Faster prompt processing (prefill)
+
+- **Bigger expert tiles for prompts.** A prompt chunk sends about 128 rows
+  to each expert, but the expert kernel worked in 64-row groups, so every
+  expert's weights were expanded to BF16 twice. Prompt chunks now use
+  128-row groups, run by 16 waves each holding the same small tile as
+  before (a first version with bigger tiles per wave ran out of registers).
+  Results are bit-identical. Q8_0 keeps 64-row groups, where the bigger
+  tile was slower.
+- **A rewritten norm and RoPE kernel.** It launched one tiny block per
+  head per token, and every block recomputed the same rotary angles with
+  `sincosf`, which is slow for the large angles of long prompts. One block
+  per token now computes the angles once and shares them across its heads.
+  Results are bit-identical.
+- **Bigger prompt chunks.** Prompts are now encoded 8192 tokens at a time
+  instead of 2048, which keeps the expert groups full. This costs about
+  2.4 GB more memory.
+
+Together: prefill is 11–18% faster with NVFP4 and 15–22% faster with FP8,
+and time to first token falls with it. A single request's denoising steps
+are unchanged.
+
+### Several requests at once (`--sessions N`)
+
+- Each session holds its own KV caches, so up to N requests (several users
+  or agents) run at once, each reusing its own prompt history.
+- The denoising steps of all running requests are batched into one forward
+  pass, and new prompts and finished canvases are encoded in the same pass.
+- The gain in total throughput is modest on this GPU: about 19% for short
+  question-and-answer requests (MMLU) from four clients, and 10–20% for
+  long fixed-length replies. A single 256-token canvas already keeps the
+  matrix units busy, so only the expert products get cheaper when canvases
+  share a step. With one session, the outputs are bit-identical to before.
+
+### Tried and dropped
+
+- 256-row expert groups for the 8192-token chunks: no faster.
+- Two ways of hiding memory latency in the NVFP4 expert kernel: both
+  slower. Measurement showed the kernel is limited by fixed work per stage,
+  not by decoding FP4 or by reading the weights.
+- The global attention kernel, now a third of long-prompt prefill, was left
+  as it is: the 64 KB of on-chip memory per workgroup leaves no room for
+  bigger tiles at head dimension 512.

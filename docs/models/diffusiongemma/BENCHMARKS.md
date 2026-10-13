@@ -3,8 +3,8 @@
 Measured 2026-10-11 and 2026-10-12 on a Ryzen AI Max+ 395 / Radeon 8060S
 (`gfx1151`, 121 GiB unified memory, measured device read bandwidth 242 GB/s),
 Linux 7.2.5, ROCm 7.2.3 (Ubuntu 24.04 container), Gufo `92aaed5` plus this
-DiffusionGemma port. FP8 is the main format. One request at a time; no other
-GPU workload.
+DiffusionGemma port. FP8 is the main format. One request at a time (except
+under "Concurrent requests"); no other GPU workload.
 
 Weights: `google/diffusiongemma-26B-A4B-it` revision `f7f5b7f5` (BF16),
 `RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` revision `3b3dae46` (FP8),
@@ -99,6 +99,77 @@ as prompts get longer. Other formats on Strix Halo, generation tok/s at
 72.5 / 69.9, BF16 72.4 / 68.7 / 75.7 / 65.9. GB10's runs at concurrency 2
 and 4 have no counterpart: Gufo serves one request at a time.
 
+## Ablation (2026-10-12, round 2)
+
+Each change alone on the round-1 build, then all retained changes, with
+`gufo-diffusion-gemma bench` (story continuation, 512 tokens out, mean of
+two interleaved rounds). Prefill tok/s and ms per denoising step, change
+against the baseline. Details in [EXPERIMENTS.md](EXPERIMENTS.md#round-2-prefill-and-concurrent-requests-2026-10-12).
+
+NVFP4:
+
+| Build | Prefill 2K | 8K | 32K | ms/step 2K | 8K | 32K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 3,660 | 3,270 | 2,530 | 122.0 | 135.8 | 178.4 |
+| 128-row expert groups for prompt chunks | +7.4% | +6.4% | +4.4% | +0.1% | +0.2% | −0.3% |
+| Norm/RoPE: one block per token | +5.8% | +4.6% | +3.0% | −0.2% | −0.3% | −0.4% |
+| 8192-token prompt chunks | −0.6% | +5.8% | +3.8% | +0.5% | +0.6% | +0.2% |
+| **All retained** (with the sessions engine) | **+11.4%** | **+18.2%** | **+12.5%** | **−0.1%** | **0.0%** | **−0.2%** |
+| All retained, absolute | 4,077 | 3,866 | 2,845 | 121.9 | 135.7 | 178.1 |
+
+FP8:
+
+| Build | Prefill 2K | 8K | 32K | ms/step 2K | 8K | 32K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 3,331 | 3,012 | 2,358 | 138.5 | 153.2 | 196.1 |
+| 128-row expert groups for prompt chunks | +10.1% | +9.0% | +6.9% | +0.1% | 0.0% | 0.0% |
+| Norm/RoPE: one block per token | +5.1% | +4.0% | +3.0% | −0.3% | −0.2% | 0.0% |
+| 8192-token prompt chunks | +0.5% | +6.1% | +3.5% | +0.2% | +0.9% | +1.1% |
+| **All retained** (with the sessions engine) | **+15.9%** | **+21.5%** | **+14.5%** | **+0.1%** | **+1.1%** | **+1.0%** |
+| All retained, absolute | 3,861 | 3,659 | 2,701 | 138.7 | 154.9 | 198.1 |
+
+A 2K prompt is one chunk either way, so the chunk size changes nothing
+there. The 128-row groups and the RoPE kernel are bit-identical to the
+baseline; larger chunks change only the order of floating-point sums in
+attention. Single-request denoising steps are unchanged within about 1%
+(FP8 at 8K/32K, +1%, comes with the larger chunks).
+
+## Concurrent requests
+
+`gufo-diffusion-gemma throughput`: 8 fixed-length requests of 1,024 tokens
+(end tokens suppressed), each on its own slice of the book so that none
+reuses another's prompt, run by as many client threads as sessions. NVFP4.
+Total output tok/s over the run; per-request ms per step is the wall time
+of the batched steps it took part in.
+
+| Prompt | Sessions | Total tok/s | Per-request tok/s | ms / step | First block s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2K | 1 | 55.2 | 55.2 | 125.5 | 5.31 |
+| 2K | 2 | 60.7 (+10%) | 30.6 | 231.4 | 9.46 |
+| 2K | 4 | 65.9 (+19%) | 17.2 | 416.9 | 17.37 |
+| 8K | 1 | 49.3 | 49.3 | 137.0 | 7.41 |
+| 8K | 2 | 51.0 (+3%) | 26.5 | 260.1 | 13.14 |
+| 8K | 4 | 54.0 (+10%) | 14.7 | 479.7 | 25.80 |
+
+Short requests gain more, because their prompts are encoded in the same
+passes as the other requests' steps. 400 recorded MMLU requests (5-shot
+prompts of about 400 tokens, mostly reused, single-letter answers), four
+client threads against `gufo serve`, NVFP4:
+
+| Server | Requests / s |
+| --- | ---: |
+| Round 1 (one request at a time) | 3.18 |
+| Round 2, `--sessions 1` | 3.20 |
+| Round 2, `--sessions 4`, prompts encoded between steps | 3.51 |
+| Round 2, `--sessions 4`, prompts encoded within steps | **3.80 (+19%)** |
+
+One canvas already keeps the matrix units busy: four canvases cost 3.15
+single steps at 2K (only the expert products amortise; see
+[EXPERIMENTS.md](EXPERIMENTS.md#concurrent-requests)), and at 8K attention
+grows with each canvas's context and each new request's prompt is encoded
+between steps. Sessions mainly let several users and agents share one
+server with separate caches; the throughput gain is modest.
+
 ## Ablation (2026-10-11, evening)
 
 Each change alone on the afternoon build (history below), then all
@@ -137,9 +208,10 @@ read at 180–200 GB/s, about 83% of DRAM bandwidth), dense products about
 matrix floor), attention about 10 ms, sampler, norms, router and layer
 finish about 13 ms. The hardware floor for a step is about 95 ms. At a 32K
 prompt, global attention adds about 58 ms per step (about 24 TFLOPS).
-Prefill at 32K runs at about 40% of its floor (13.5 s against 5.4 s): the
-expert products (about 21 TFLOPS on prompt chunks) and global attention are
-the gap; see [EXPERIMENTS.md](EXPERIMENTS.md).
+Prefill at 32K ran at about 40% of its floor (13.5 s against 5.4 s) before
+round 2 and at about 48% after it (NVFP4, 11.3 s). Global attention is then
+34% of it (3.8 s, about 23 TFLOPS) and the expert products 27% (3.1 s,
+about 30 TFLOPS); see [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## History
 

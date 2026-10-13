@@ -61,22 +61,23 @@ scores 0.022 there, and two Transformers attention implementations differ by
 0.018 ([QUALITY.md](QUALITY.md)).
 
 The BF16 weights need about 47 GiB of GPU-visible memory (GTT on Strix Halo) plus
-1.4 GiB for a blocked copy of the LM head, about 1 GiB of scratch and 20 KiB
-per context token for the global-layer KV
-cache. Stop other GPU servers first.
+1.4 GiB for a blocked copy of the LM head and 20 KiB per context token per
+session for the global-layer KV cache. Scratch and sliding-layer caches take
+about 4.4 GiB with one session (8192-token prompt chunks) and about 9.7 GiB
+with four. Stop other GPU servers first.
 
 ## Serve
 
 ```sh
-gufo serve --port 8080 llm --model models/diffusiongemma \
+gufo serve --port 8080 --sessions 4 llm --model models/diffusiongemma \
   --served-model-name diffusiongemma --context 131072
 ```
 
 `--model` takes the checkpoint directory; it is recognised by its
 `config.json` (`model_type: diffusion_gemma`). Startup loads the weights
 (about 5 s from a warm page cache), blocks the dense matrices in place for
-the matrix kernel and runs one prompt chunk and two denoising steps, so the
-first request runs at full speed. Every kernel is Gufo's own: there is no
+the matrix kernel and runs one prompt chunk and a short request per session,
+so the first requests run at full speed. Every kernel is Gufo's own: there is no
 tuning step, and repeated runs are bit-identical.
 
 ```sh
@@ -92,22 +93,25 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Length | `max_tokens` (default: until EOS or the context is full); generation runs whole canvases and the reply is truncated to the limit (finish reason `length` unless an end token falls within it). On `/v1/completions`, `ignore_eos: true` never samples the end tokens, so the reply runs to `max_tokens` (fixed-length benchmarks). |
 | Thinking | Off by default; a thinking channel the model emits is removed. `chat_template_kwargs.enable_thinking: true` (or `reasoning`) renders the prompt with thinking on and returns the channel as `reasoning_content`. Raw completions keep it as `<think>...</think>` text. |
 | Tools | Function tools in the checkpoint's native format (declarations, calls and results rendered as `chat_template.jinja` does, checked byte-for-byte against Transformers on coding-agent conversations); calls are returned as OpenAI `tool_calls`, streamed once each call is complete. Tested with the pi coding agent. |
-| Prompt reuse | A request reuses the longest prompt prefix it shares with the previous request's cache (its prompt and committed reply canvases) when the divergence lies within the last 4096 cached tokens; only the rest is encoded. Logged as `reused=` and reported as cached prompt tokens. |
+| Sessions | `--sessions N` (default 1) holds N requests' caches. Up to N requests run at once: each forward pass runs one denoising step of every request's canvas and, in the same pass, finished canvases being committed and up to 2048 tokens of new prompts (8192 when nothing else is running). Further requests wait for a free session. On this GPU one canvas already keeps the matrix units busy, so batching raises total throughput by up to about 1.3x rather than Nx; see [BENCHMARKS.md](BENCHMARKS.md#concurrent-requests). |
+| Prompt reuse | A request takes the free session whose cache (an earlier prompt and its committed reply canvases) shares the longest prefix with its prompt, else the least recently used one, and reuses that prefix when the divergence lies within the last 4096 cached tokens; only the rest is encoded. Logged as `reused=` and reported as cached prompt tokens. `cache_prompt: false` on raw completions encodes the whole prompt. |
 | Structured output | Not supported: `response_format` and Responses `text.format` are rejected with 400 `unsupported_response_format`, because the diffusion sampler cannot apply a JSON grammar token by token. For the same reason tool arguments are not constrained to their schema. |
-| Not supported | Images, concurrent sessions (requests run one at a time). |
+| Not supported | Images. |
 
 ## Command-line tool
 
 `gufo-diffusion-gemma` (built beside `gufo`) checks the tokenizer and chat
 template, runs single prompts, writes reference logits for
-[QUALITY.md](QUALITY.md) and runs the context sweep in
-[BENCHMARKS.md](BENCHMARKS.md):
+[QUALITY.md](QUALITY.md) and runs the context sweep and the concurrent
+throughput test in [BENCHMARKS.md](BENCHMARKS.md):
 
 ```sh
 gufo-diffusion-gemma generate --model models/diffusiongemma \
   --prompt "Write a haiku about lighthouses." --max-tokens 256
 gufo-diffusion-gemma bench --model models/diffusiongemma --corpus book.txt \
   --contexts 512,2048,8192,32768 --reps 3 --gen-tokens 512
+gufo-diffusion-gemma throughput --model models/diffusiongemma \
+  --corpus book.txt --context 2048 --sessions 4 --requests 8
 ```
 
 `--profile` prints per-phase GPU time for each request.
@@ -129,14 +133,14 @@ sampler's decisions (CPU).
 | `weights.*` | Safetensors index, fused QKV / gate-up placement, BF16 loader. |
 | `weights_gguf.cpp`, `weights_fp8.cpp`, `weights_nvfp4.cpp` | Q8_0 GGUF, FP8 and NVFP4 checkpoint loaders: quantized experts kept on the device as stored, other matrices dequantized to BF16. |
 | `upload.*` | Checkpoint ranges to device memory through Gufo's shared weight upload (`src/core/hip/weight_upload`), with batched device staging for tensors converted on load. |
-| `engine.*` | Encoder and decoder passes, the block-diffusion loop, prompt reuse. |
+| `engine.*` | Sessions (each request's KV caches) and the request scheduler: one forward pass over every active request's canvas plus commits and prompt chunks as causal segments, the block-diffusion loop per request, prompt reuse. |
 | `cache_state.*` | KV-cache bookkeeping: global and sliding slots, reuse history, prefix reuse. |
 | `denoise.*` | The sampler's host decisions: temperature schedule, entropy-bound acceptance, convergence, reply length. |
 | `dense.hip` | Every dense product (QKV, output, MLP, router, self-conditioning MLP, LM head) for any row count: FP32 output, 256 x 128 (or 128 x 128) tiles over row-major activations and weights blocked in place at load, 64-deep stages with register prefetch; ordered split reduction for outputs with few tiles. |
 | `soft_embed.hip` | Self-conditioning soft embedding over the whole vocabulary: all 256 canvas rows per workgroup (the embedding table is read once), vocabulary split with ordered FP32 partial sums, probabilities in a blocked layout written by the sampler. |
 | `attention.hip` | WMMA flash attention for head dimensions 256 and 512: causal + sliding window (encoder) and bidirectional (decoder), split-key with merge for short query sets. The next key/value tile is loaded into registers while the current one is computed; head dimension 512 runs two blocks per WGP. |
-| `moe.hip` | Grouped expert GEMMs (BF16, Q8_0, FP8 or NVFP4 weights; NVFP4 is decoded with a byte-permute table built from each block scale), one workgroup per 64-row group of an expert: gate/up with fused GELU, down with BF16 output; LDS-staged and double-buffered with LDS-only barriers. |
-| `kernels.hip` | Norms, RoPE (default and proportional), routing, dispatch and its group list, the layer finish with the expert combine, the per-row sampler (softcap, temperature, end-token suppression, entropy, argmax, Gumbel sample, self-conditioning softmax), dequantization. |
+| `moe.hip` | Grouped expert GEMMs (BF16, Q8_0, FP8 or NVFP4 weights; NVFP4 is decoded with a byte-permute table built from each block scale), one workgroup per 64-row group of an expert (canvases; double-buffered) or 128-row group (prompt chunks and batched canvases; 16 waves, single-buffered): gate/up with fused GELU, down with BF16 output; LDS-staged with LDS-only barriers. |
+| `kernels.hip` | Norms, RoPE (default and proportional; one block per token with the rotary angles shared by its heads), routing, dispatch and its group list, the layer finish with the expert combine, the per-row sampler (softcap, temperature, end-token suppression, entropy, argmax, Gumbel sample, self-conditioning softmax), dequantization. |
 | `device.hpp`, `hip_check.hpp`, `profiler.*` | WMMA fragment helpers and layout, HIP error checks, per-phase GPU timing. |
 
 The HTTP adapter is `src/cli/serve/diffusion_gemma_backend.*`.

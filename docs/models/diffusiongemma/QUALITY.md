@@ -52,6 +52,21 @@ sensitivity described below rather than a consistent shift. The 8-bit
 checkpoints against Gufo BF16 (afternoon): FP8 0.0277 / 0.0780, Q8_0
 0.0444 / 0.0882.
 
+Round 2 (2026-10-13): with the same 2048-token prompt chunks the round-2
+build gives exactly the logits above (every change except the chunk size is
+bit-identical). With its default 8192-token chunks the 2,592-token prompt is
+one chunk, which changes the order of some attention sums:
+
+| Gufo weights | Step 1 KL, 2048 → 8192 chunks | Step 2 KL, 2048 → 8192 chunks |
+| --- | ---: | ---: |
+| NVFP4 | 0.0704 → 0.0659 | 0.0860 → 0.0938 |
+| FP8 | 0.0292 → 0.0305 | 0.0458 → 0.0682 |
+| BF16 | 0.0219 → 0.0166 | 0.0728 → 0.0436 |
+
+Step 1 moves by at most 0.005 and step 2 by up to ±0.03 in both directions,
+the same sensitivity as the evening's changes. The round-2 MMLU run below
+also uses 8192-token chunks.
+
 NVFP4 diverges about 2.4 times as much as FP8 at step 1. The expert decode is
 exact (each 4-bit value times its FP8 block scale is representable in BF16),
 and `diffusion_gemma_kernels_hip_test` checks the expert products against a
@@ -132,6 +147,14 @@ Exact match after the task's first-line filter.
 The two checkpoints disagree on 681 questions: FP8 alone is right on 370,
 NVFP4 alone on 311 (McNemar p ≈ 0.02). The 4-bit experts cost about 0.4
 points.
+
+Round 2 (2026-10-13), NVFP4, `--sessions 4` and four concurrent requests,
+so that most denoising steps are batched (the build before prompt chunks
+and commits joined the batched pass): 80.6% (11,322 correct, 12
+answers not a single letter, 69 min). Against the one-at-a-time run the
+answers differ in correctness on 21 questions (14 right only one at a
+time, 7 only batched; McNemar p ≈ 0.19): batching changes the order of some
+floating-point sums, not the accuracy.
 
 These scores are for thinking off and are not comparable with thinking-on
 runs. The same harness against the llama.cpp DiffusionGemma server (Q5_K_M

@@ -198,3 +198,92 @@ end-to-end results are in [BENCHMARKS.md](BENCHMARKS.md#ablation-2026-10-11-even
   not fit in 64 KB of LDS at head dimension 512.
 - Rejected: more key splits for short decodes (256/128/64-key minimum):
   no gain or slower.
+
+## Round 2: prefill and concurrent requests (2026-10-12)
+
+The engine profile now splits each attention block into the QKV product,
+norm/RoPE, the attention kernel and the output product. NVFP4, 32K prompt,
+before this round (13.0 s of prefill): global attention 3.71 s, expert
+products 4.06 s, the sliding layers' QKV product 0.86 s and their norm/RoPE
+0.63 s, sliding attention 0.72 s, output products 0.97 s, dense MLP 0.90 s.
+
+- Retained: 128-row expert groups for prompt chunks (`moe.hip`). A 2048-row
+  chunk averages 128 rows per expert, so 64-row groups widened each weight
+  tile twice. The 128-row kernel keeps the 64-row kernel's per-wave tile
+  (32 x 32, 16 waves, 512 threads) with one LDS buffer; an 8-wave version
+  with 32 x 64 per wave spilled 70-122 registers and was 30% slower.
+  Prefill +4 to +9% (NVFP4, FP8, BF16); Q8_0 1-3% slower, so it keeps 64.
+  Bit-identical.
+- Retained: one block per token for the Q/K/V norm and RoPE
+  (`QkvNormRopeKernel`). The per-head kernel launched 65,536 128-thread
+  blocks per 2048-row chunk, each recomputing `sincosf` of large angles
+  (the slow argument-reduction path) for the same position. The angles
+  are now computed once per token into LDS and each wave takes one head;
+  the squares are summed in the old kernel's order, so the outputs are
+  bit-identical. Sliding norm/RoPE 0.63 s -> 0.21 s at 32K.
+- Retained: 8192-token prompt chunks (was 2048). With 128-row groups,
+  larger chunks fill the expert groups: 8K prefill +6.7%, 32K +4.8% (4096:
+  +4.2%, +3.2%). Costs about 2.4 GB more scratch and sliding cache.
+- Rejected: 256-row expert groups for 8192-row chunks (1024 threads): NVFP4
+  1-5% slower, FP8 unchanged.
+- Rejected, NVFP4 expert products on recorded canvas routing (gate/up
+  1.16 ms, 145 GB/s; FP8 1.60 ms, 188 GB/s): prefetching two stages ahead
+  (1.22 ms; the run-time ring index went to scratch) and 128-deep stages
+  for gate/up (1.44 ms). With the FP4 decode removed altogether (wrong
+  values) the kernel took 1.03 ms: the limit is the per-stage work
+  (barriers, activation loads, matrix work over mostly empty row tiles),
+  not the decode or the weight bytes.
+- Not attempted: merging the sampler's passes. `SampleRows` reads each
+  row's 1 MB of FP32 logits three times (max and Gumbel, sums, the
+  self-conditioning probabilities): about 940 MB per canvas with the
+  probability writes, about 4 of its 6 ms. An online softmax would drop one
+  pass (about 1 ms per step, 1%) but change the order of the sums, so the
+  sampled canvases would no longer match the current ones bit for bit.
+- Not attempted: the global attention kernel (34% of 32K prefill after
+  this round). Its tiles are limited by LDS at head dimension 512 (the
+  key tile, transposed value tile and the cross-wave score partials fill
+  64 KB), and packing query heads that share a KV head does not change
+  the K/V traffic or staging per block. Transposed V in the cache remains
+  the deferred 6% option.
+
+### Concurrent requests
+
+The engine holds `--sessions` caches. Each session's sliding caches hold
+the window, the reuse history and one canvas; prompt chunks run in shared
+stage caches, copied in before and out after (with one session the
+sliding caches hold a whole chunk, as before). A worker thread admits
+requests to free sessions (longest reusable prefix first), runs one prompt
+chunk (2048 tokens while others denoise) and then one denoising step over
+every active canvas: one forward pass over the stacked rows, with
+attention, norm/RoPE writes and sampling per canvas. With one session the
+outputs are bit-identical to the single-session engine.
+
+Per-step cost, NVFP4, 2K context, the throughput tool (`--profile`):
+
+| Phase | 1 canvas | 4 canvases | Ratio |
+| --- | ---: | ---: | ---: |
+| Expert products | 54.7 ms | 134.5 ms | 2.46 |
+| Self-conditioning, LM head, sampler | 24.2 ms | 89.8 ms | 3.71 |
+| Dense products and MLP | 25.3 ms | 92.1 ms | 3.64 |
+| Attention (incl. norm/RoPE) | 16.3 ms | 64.1 ms | 3.93 |
+| Layer finish, post-attention, router | 7.0 ms | 21.2 ms | 3.03 |
+| Whole step | 127.7 ms | 402.2 ms | 3.15 |
+
+One 256-row canvas already keeps the matrix units busy (the dense products
+run at 36-47 TFLOPS), so only the expert products amortise. Four canvases
+cost 3.15 steps: total throughput can rise by at most about 1.27x.
+
+- Retained: 128-row expert groups once experts average 32 rows (two or more
+  canvases): step time -1.7% (two canvases), -3.4% (four).
+- Retained: prompt chunks and committed canvases in the batched pass. Each
+  pass runs every denoising canvas and then, as causal segments, the
+  finished canvases to commit and prompt chunks within a row budget (2048
+  rows while others denoise, at most one chunk through the stage caches);
+  a finished canvas is committed in the next pass, which keeps each
+  request's random draws in order. Self-conditioning, the LM head and the
+  sampler run over the canvas rows only. With one session nothing is
+  mixed and the outputs are bit-identical. 400 recorded MMLU requests
+  (5-shot prompts, single-letter answers) from four clients: 3.51 -> 3.80
+  requests/s (the round-1 server: 3.18; one session: 3.20). Fixed-length
+  1,024-token requests: within ±2% per canvas step (mixing changes the order
+  of some sums, so the trajectories and step counts differ).
