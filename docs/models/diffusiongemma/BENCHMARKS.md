@@ -71,33 +71,66 @@ Startup to the first accepted request: 8–10 s (load 7–9 s, warmup 1.1–1.2
 s; NVFP4 6 s); there is no tuning step. The NVFP4 rows were measured
 2026-10-12 with the same protocol.
 
-## SPEED-Bench at concurrency 1, against DGX Spark (GB10)
+## SPEED-Bench against DGX Spark (GB10)
 
 [diffu-benching](https://github.com/iv2nl0b9v/diffu-benching) published
 DiffusionGemma NVFP4 results for vLLM on an NVIDIA GB10 (DGX Spark). The same
-workload on Gufo: SPEED-Bench `throughput_2k`/`8k`/`16k`/`32k`, 20 prompts
-each after 2 warm-ups, the NVFP4 checkpoint, thinking on, end tokens
-suppressed (`ignore_eos`) so every reply is exactly 1,024 tokens, AIPerf
-0.12.0, one request at a time. Prompts were rendered with the chat template
-and sent to `/v1/completions`. Generation tok/s uses their correction: the 768
-tokens after the first 256-token canvas divided by the time after the first
-token. E2E is 1,024 tokens over the whole request. Means per request;
-GB10 figures are theirs (canvas 256, up to 48 steps).
+workload on Gufo, measured 2026-10-12 (round 1) and 2026-10-13 (round 2):
+SPEED-Bench `throughput_2k`/`8k`/`16k`/`32k`, their recorded prompts rendered
+with the checkpoint's chat template (thinking on; token-identical to the
+Hugging Face tokenizer vLLM uses: 2,274 / 9,088 / 17,815 / 36,352 tokens on
+average), 20 requests after 2 warm-ups, sequential sampling, seed 42, end
+tokens suppressed so that every reply is exactly 1,024 tokens, AIPerf
+0.12.0, `/v1/completions` with `return_token_ids` and `cache_prompt: false`,
+`--context 65536`. Every run is scored with diffu-benching's own audit code
+and passes it (1,024 tokens, no stop tokens, 256-token first chunk) and a
+check that the streamed text equals the decoded token IDs. GB10 figures are
+theirs: the released (non-rolling) sampler, canvas 256, up to 48 steps
+(`results/rolling-matrix` and `results/rolling-long-context`).
 
-| Split | Prompt tokens | GB10 gen tok/s | Gufo NVFP4 | GB10 E2E tok/s | Gufo NVFP4 | GB10 TTFT s | Gufo NVFP4 |
+Generation tok/s is their corrected per-user rate after the first canvas;
+total tok/s is output over the whole run; TTFT is seconds and, at
+concurrency 2 and 4, includes waiting for a session (round 1 served one
+request at a time).
+
+Concurrency 1:
+
+| Split | GB10 gen tok/s | Gufo round 1 | Gufo round 2 | GB10 TTFT | Gufo round 1 | Gufo round 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2K | 142.5 | 120.2 | 115.6 | 2.21 | 2.63 | 2.71 |
+| 8K | 130.3 | 100.0 | 100.1 | 3.50 | 5.17 | 5.07 |
+| 16K | 121.0 | 94.1 | 98.3 | 6.51 | 9.49 | 8.37 |
+| 32K | 92.9 | 73.3 | 76.2 | 13.55 | 19.61 | 17.74 |
+
+Prefill from the server's log, round 1 → round 2: 3,416 → 4,018 /
+3,143 → 3,667 / 2,867 → 3,306 / 2,406 → 2,688 tok/s (+12 to +18%); ms per
+step unchanged. The time to first token also holds the first canvas's
+denoising, whose step count varies from run to run, so at 2K and 8K the
+faster prefill is within that spread; at 16K and 32K it is 10-12% sooner.
+
+Several requests at once (Gufo round 2 with `--sessions 4`):
+
+| Split | Concurrency | GB10 total tok/s | Gufo round 1 | Gufo round 2 | GB10 TTFT | Gufo round 1 | Gufo round 2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2K | 2,209 | 148.9 | 114.6 | 137.0 | 107.5 | 2.16 | 2.76 |
-| 8K | 8,817 | 114.7 | 107.6 | 91.8 | 81.9 | 4.33 | 5.15 |
-| 16K | 17,352 | 119.0 | 105.8 | 67.3 | 60.3 | 8.27 | 9.01 |
-| 32K | 35,427 | 77.9 | 80.4 | 35.8 | 35.2 | 18.01 | 18.53 |
+| 2K | 1 | 127.5 | 104.5 | 101.9 | 2.21 | 2.63 | 2.71 |
+| 2K | 2 | 170.6 | 102.4 | 106.7 | 3.27 | 12.23 | 4.57 |
+| 2K | 4 | 206.5 | 97.9 | 126.5 | 5.20 | 30.51 | 8.66 |
+| 8K | 1 | 102.8 | 75.4 | 74.8 | 3.50 | 5.17 | 5.07 |
+| 8K | 2 | 130.9 | 72.4 | 82.6 | 5.18 | 18.75 | 8.20 |
+| 8K | 4 | 149.9 | 74.9 | 88.2 | 8.64 | 42.23 | 14.68 |
+| 16K | 1 | 74.9 | 53.8 | 57.3 | 6.51 | 9.49 | 8.37 |
+| 16K | 2 | 87.0 | 55.3 | 61.3 | 10.43 | 27.16 | 14.76 |
+| 16K | 4 | 95.2 | 55.1 | 63.9 | 16.01 | 60.04 | 26.59 |
+| 32K | 1 | 45.1 | 32.0 | 34.2 | 13.55 | 19.61 | 17.74 |
+| 32K | 2 | 49.8 | 32.5 | 35.5 | 18.67 | 49.20 | 27.91 |
+| 32K | 4 | 53.4 | 34.0 | 36.7 | 33.73 | 98.97 | 54.10 |
 
-Prompt tokens are Gufo's count; vLLM counts about 3% more for the same text
-(2,274 / 9,088 / 17,815 / 36,352). Strix Halo reaches 77–103% of GB10's
-generation speed and 78–98% of its end-to-end speed, with the gap closing
-as prompts get longer. Other formats on Strix Halo, generation tok/s at
-2K / 8K / 16K / 32K: FP8 103.2 / 85.9 / 80.1 / 68.2, Q8_0 79.7 / 76.2 /
-72.5 / 69.9, BF16 72.4 / 68.7 / 75.7 / 65.9. GB10's runs at concurrency 2
-and 4 have no counterpart: Gufo serves one request at a time.
+At concurrency 4, round 2 gives 8-29% more total output than round 1 and
+first tokens 1.8-3.5 times sooner, and Strix Halo reaches 59-69% of GB10's
+total throughput (round 1: 47-64%). GB10 gains more from batching, probably
+because its matrix units (about twice as fast) are not saturated by one
+canvas, while Strix Halo's are. FP8 on Strix Halo, concurrency 1, round 1, generation tok/s: 97.1 /
+88.5 / 85.8 / 71.4.
 
 ## Ablation (2026-10-12, round 2)
 

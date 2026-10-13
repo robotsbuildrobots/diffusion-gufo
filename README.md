@@ -27,7 +27,9 @@ I may submit this fork to gufo, if so this fork will not be maintained.
   Responses and completions, streamed one canvas at a time, with function
   tools, prompt-prefix reuse, optional thinking
   (`chat_template_kwargs.enable_thinking`), and `ignore_eos` / `cache_prompt`
-  on raw completions.
+  / `return_token_ids` on raw completions. `--sessions N` runs up to N
+  requests at once, each with its own caches, their denoising steps batched
+  into one forward pass.
 - **Docs:** [what changed, in plain English](docs/models/diffusiongemma/CHANGES.md),
   [usage](docs/models/diffusiongemma/README.md),
   [benchmarks](docs/models/diffusiongemma/BENCHMARKS.md),
@@ -57,8 +59,10 @@ Generation, 508-token prompt and 512 tokens out:
 
 On the SPEED-Bench prompts that
 [diffu-benching](https://github.com/iv2nl0b9v/diffu-benching) ran on an NVIDIA
-DGX Spark (GB10, vLLM, NVFP4), Gufo NVFP4 reaches 77–103% of the Spark's
-generation speed per user, with the gap closing as prompts get longer.
+DGX Spark (GB10, vLLM, NVFP4), Gufo NVFP4 reaches 77–82% of the Spark's
+generation speed per user, and 59–69% of its total throughput with four
+concurrent requests (`--sessions 4`); see
+[the comparison](docs/models/diffusiongemma/BENCHMARKS.md#speed-bench-against-dgx-spark-gb10).
 
 Accuracy against Hugging Face Transformers on the original BF16 checkpoint
 (mean KL per canvas position, first denoising step) and MMLU (all 14,042
